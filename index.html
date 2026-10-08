@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
+<meta name="theme-color" content="#4f46e5">
+<meta name="description" content="Removedor de Objetos con IA JPB - Remueve objetos de imágenes con IA local">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Removedor de Objetos con IA JPB</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+
+<script>
+(function() {
+  var isAndroid = /Android/i.test(navigator.userAgent);
+  var isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  var lowMem = (navigator.deviceMemory && navigator.deviceMemory <= 4);
+  var lowCores = (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4);
+  if (isAndroid || (isMobile && (lowMem || lowCores))) {
+    document.documentElement.classList.add('low-gpu');
+  }
+  if (isMobile) document.documentElement.classList.add('is-mobile');
+  try {
+    var t = localStorage.getItem('jpb-theme');
+    if (t === 'dark') document.documentElement.classList.add('dark');
+    else if (t === 'light') document.documentElement.classList.add('light');
+  } catch(e) {}
+})();
+</script>
+</head>
+<body>
+
+<!-- Splash -->
+<div id="splash" class="splash">
+  <div class="splash-content">
+    <img src="icons/icon-512.png" alt="JPB" class="splash-icon">
+    <h1 class="splash-title">Removedor de Objetos con IA JPB</h1>
+    <p class="splash-sub">Remueve Objetos con IA local</p>
+  </div>
+</div>
+
+<!-- Header -->
+<header id="appHeader" class="app-header">
+  <div class="header-left">
+    <button id="menuBtn" class="icon-btn" title="Menú" aria-label="Menú" type="button">
+      <span class="hamburger">☰</span>
+    </button>
+    <span id="fileName" class="filename">Sin imagen</span>
+  </div>
+  <div class="header-right">
+    <button id="helpBtn" class="icon-btn" title="Ayuda" type="button">
+      <img src="icons/help.png" alt="Ayuda" class="ico">
+    </button>
+    <div id="themeSwitch" class="theme-switch" title="Cambiar tema" role="switch" aria-checked="false" tabindex="0">
+      <span class="ts-icon ts-sun"><img src="icons/sun.png" alt="Claro"></span>
+      <span class="ts-icon ts-moon"><img src="icons/night.png" alt="Oscuro"></span>
+      <span class="ts-thumb"></span>
+    </div>
+    <button id="saveBtn" class="icon-btn" title="Guardar (Ctrl+S)" type="button">
+      <img src="icons/save.png" alt="Guardar" class="ico">
+    </button>
+    <button id="openBtn" class="icon-btn" title="Abrir (Ctrl+O)" type="button">
+      <img src="icons/open.png" alt="Abrir" class="ico">
+    </button>
+  </div>
+</header>
+
+<!-- Layout -->
+<div id="layout" class="layout">
+
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-scroll">
+
+      <section class="section" data-sec="model">
+        <button class="sec-head" type="button">
+          <img src="icons/aimodel.png" alt="" class="ico">
+          <span>Modelo IA</span>
+          <span class="chev">▾</span>
+        </button>
+        <div class="sec-body">
+          <label class="field-label">Modelo</label>
+          <select id="modelSelect" class="select">
+            <option value="lama512-fp16">LAMA 512 FP16 (WebGPU)</option>
+            <option value="lama512-int8">LAMA 512 INT8 (Móvil)</option>
+          </select>
+
+          <button id="manageModelsBtn" class="btn btn-ghost btn-block" type="button">
+            <img src="icons/info.png" alt="" class="ico">
+            Gestionar modelos
+          </button>
+
+          <div id="aiStatus" class="status">Listo</div>
+        </div>
+      </section>
+
+      <section class="section" data-sec="mask">
+        <button class="sec-head" type="button">
+          <img src="icons/maskedit.png" alt="" class="ico">
+          <span>Editor de Máscara</span>
+          <span class="chev">▾</span>
+        </button>
+        <div class="sec-body">
+          <div class="tool-grid tool-grid-3">
+            <button class="tool-btn active" data-tool="brush" title="Pincel" type="button">
+              <img src="icons/pincel.png" alt=""><span>Pincel</span>
+            </button>
+            <button class="tool-btn" data-tool="rect" title="Rectángulo" type="button">
+              <img src="icons/rect.png" alt=""><span>Rect</span>
+            </button>
+            <button class="tool-btn" data-tool="lasso" title="Lazo" type="button">
+              <img src="icons/lasso.png" alt=""><span>Lazo</span>
+            </button>
+          </div>
+
+          <label class="field-label">Tamaño pincel: <span id="brushSizeVal">30</span> px</label>
+          <input type="range" id="brushSize" class="range" min="1" max="100" value="30">
+
+          <div class="mode-row">
+            <button id="modeAdd" class="mode-btn active" data-mode="add" type="button">
+              <img src="icons/add.png" alt="" class="ico"> Añadir
+            </button>
+            <button id="modeSub" class="mode-btn" data-mode="sub" type="button">
+              <img src="icons/remove.png" alt="" class="ico"> Quitar
+            </button>
+          </div>
+
+          <div class="row2">
+            <button id="maskClear" class="btn btn-ghost" type="button">
+              <img src="icons/cancel.png" alt="" class="ico"> Limpiar
+            </button>
+            <button id="maskApply" class="btn btn-primary" type="button">
+              <img src="icons/ok.png" alt="" class="ico"> Remover
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <div class="reset-wrap">
+        <button id="resetBtn" class="btn btn-danger btn-block" type="button">
+          <img src="icons/reset.png" alt="" class="ico"> Reiniciar
+        </button>
+      </div>
+
+    </div>
+  </aside>
+
+  <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+
+  <main id="stage" class="stage">
+
+    <div id="floatToolbar" class="float-toolbar">
+      <button id="undoBtn" class="ft-btn" title="Deshacer (Ctrl+Z)" type="button" disabled>
+        <img src="icons/undo.png" alt="Deshacer" class="ico">
+      </button>
+      <button id="redoBtn" class="ft-btn" title="Rehacer (Ctrl+Y)" type="button" disabled>
+        <img src="icons/redo.png" alt="Rehacer" class="ico">
+      </button>
+      <span class="ft-sep"></span>
+      <button id="fitBtn" class="ft-btn" title="Ajustar (0)" type="button">
+        <img src="icons/resetzoom.png" alt="Ajustar" class="ico">
+      </button>
+      <button id="toggleBtn" class="ft-btn" title="Original / Procesado" type="button">
+        <img src="icons/view.png" alt="Ver" class="ico">
+      </button>
+      <button id="copyBtn" class="ft-btn" title="Copiar (Ctrl+C)" type="button">
+        <img src="icons/copy.png" alt="Copiar" class="ico">
+      </button>
+    </div>
+
+    <div id="canvasWrap" class="canvas-wrap">
+      <div id="emptyState" class="empty-state">
+        <div class="empty-icon">🖼️</div>
+        <p>Arrastra una imagen aquí<br>o pégala con Ctrl+V</p>
+        <button id="emptySelect" class="btn btn-primary" data-action="open" type="button">
+          <img src="icons/open.png" alt="" class="ico"> Seleccionar imagen
+        </button>
+      </div>
+
+      <div id="canvasInner" class="canvas-inner" hidden>
+        <canvas id="mainCanvas"></canvas>
+      </div>
+    </div>
+
+    <input type="file" id="fileInput" accept="image/*" hidden>
+  </main>
+</div>
+
+<footer id="appFooter" class="app-footer">
+  <span id="ftDims">—</span>
+  <span id="ftSize">—</span>
+  <span id="ftZoom">100%</span>
+  <span id="ftStatus" class="ft-status">Listo</span>
+</footer>
+
+<!-- Modal Guardar -->
+<div id="saveModal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>Guardar imagen</h3>
+      <button class="modal-x" data-close="saveModal" type="button">✕</button>
+    </div>
+    <div class="modal-body">
+      <label class="field-label">Formato</label>
+      <select id="saveFormat" class="select">
+        <option value="png">PNG (transparencia)</option>
+        <option value="jpeg">JPG</option>
+        <option value="webp">WebP</option>
+        <option value="bmp">BMP</option>
+      </select>
+
+      <div id="qualityRow" class="hidden">
+        <label class="field-label">Calidad: <span id="qualityVal">92</span>%</label>
+        <input type="range" id="qualityRange" class="range" min="10" max="100" value="92">
+      </div>
+
+      <label id="exifRow" class="checkbox hidden">
+        <input type="checkbox" id="keepExif" checked>
+        <span>Conservar EXIF original</span>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" data-close="saveModal" type="button">Cancelar</button>
+      <button id="confirmSave" class="btn btn-primary" type="button">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Modelos -->
+<div id="modelsModal" class="modal" hidden>
+  <div class="modal-card modal-large">
+    <div class="modal-head">
+      <h3>Gestión de modelos IA</h3>
+      <button class="modal-x" data-close="modelsModal" type="button">✕</button>
+    </div>
+    <div class="modal-body">
+      <ul id="modelsList" class="models-list">
+        <li class="models-empty">Cargando...</li>
+      </ul>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" data-close="modelsModal" type="button">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Progreso -->
+<div id="progressModal" class="modal" hidden>
+  <div class="modal-card modal-small">
+    <div class="modal-head">
+      <h3 id="progressTitle">Descargando modelo</h3>
+    </div>
+    <div class="modal-body">
+      <div class="progress-bar">
+        <div id="progressFill" class="progress-fill"></div>
+      </div>
+      <div id="progressText" class="progress-text">0%</div>
+      <div id="progressInfo" class="progress-info"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Ayuda -->
+<div id="helpModal" class="modal" hidden>
+  <div class="modal-card modal-large">
+    <div class="modal-head">
+      <h3>Ayuda</h3>
+      <button class="modal-x" data-close="helpModal" type="button">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="tabs">
+        <button class="tab active" data-tab="tabAndroid" type="button">
+          <img src="icons/android.png" alt="" class="ico"> Android
+        </button>
+        <button class="tab" data-tab="tabWindows" type="button">
+          <img src="icons/windows.png" alt="" class="ico"> Windows
+        </button>
+        <button class="tab" data-tab="tabKeys" type="button">
+          <img src="icons/keyboard.png" alt="" class="ico"> Atajos
+        </button>
+        <button class="tab" data-tab="tabGeneral" type="button">
+          <img src="icons/info.png" alt="" class="ico"> General
+        </button>
+      </div>
+
+      <div id="tabAndroid" class="tab-panel active">
+        <h4>Uso en Android</h4>
+        <ul>
+          <li>Un dedo: <b>pan</b> o <b>dibujar</b>.</li>
+          <li>Dos dedos: <b>pinch zoom</b> + pan.</li>
+          <li>Backend IA: <b>WASM/CPU</b> con modelo INT8.</li>
+        </ul>
+      </div>
+      <div id="tabWindows" class="tab-panel">
+        <h4>Uso en Windows</h4>
+        <ul>
+          <li>Rueda: <b>zoom</b>. Shift+rueda: horizontal. Alt+rueda: vertical.</li>
+          <li>Espacio + arrastrar: <b>pan</b>.</li>
+          <li>Backend IA: <b>WebGPU</b> con modelo FP16.</li>
+        </ul>
+      </div>
+      <div id="tabKeys" class="tab-panel">
+        <h4>Atajos</h4>
+        <ul>
+          <li><b>Ctrl+O</b> Abrir · <b>Ctrl+S</b> Guardar · <b>Ctrl+C</b> Copiar</li>
+          <li><b>Ctrl+Z</b> Deshacer · <b>Ctrl+Y</b> Rehacer</li>
+          <li><b>+</b> / <b>-</b> Zoom · <b>0</b> Ajustar · <b>1</b> 100%</li>
+          <li><b>[</b> / <b>]</b> Pincel</li>
+        </ul>
+      </div>
+      <div id="tabGeneral" class="tab-panel">
+        <h4>General</h4>
+        <ul>
+          <li>Procesamiento <b>local</b>, sin subir imágenes.</li>
+          <li>Modelos cacheados en <b>IndexedDB</b>.</li>
+          <li>Editor: <b>pincel, rectángulo, lazo</b>.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" data-close="helpModal" type="button">Entendido</button>
+    </div>
+  </div>
+</div>
+
+<script src="db.js" defer></script>
+<script src="app.js" defer></script>
+</body>
+</html>
