@@ -84,8 +84,8 @@
         <div class="sec-body">
           <label class="field-label">Modelo</label>
           <select id="modelSelect" class="select">
-            <option value="lama512-fp16">LAMA 512 FP16 (WebGPU)</option>
-            <option value="lama512-int8">LAMA 512 INT8 (Móvil)</option>
+            <option value="lama-fp16">LAMA FP16 (Alta calidad)</option>
+            <option value="lama-int8">LAMA INT8 (Rápido en móvil)</option>
           </select>
 
           <button id="manageModelsBtn" class="btn btn-ghost btn-block" type="button">
@@ -290,8 +290,9 @@
         <h4>Uso en Android</h4>
         <ul>
           <li>Un dedo: <b>pan</b> o <b>dibujar</b>.</li>
-          <li>Dos dedos: <b>pinch zoom</b> + pan.</li>
-          <li>Backend IA: <b>WASM/CPU</b> con modelo INT8.</li>
+          <li>Dos dedos en paralelo (scroll): <b>pan</b>.</li>
+          <li>Dos dedos separándose/juntándose: <b>zoom</b>.</li>
+          <li>Backend IA: <b>WASM/CPU</b>. Recomendado modelo INT8.</li>
         </ul>
       </div>
       <div id="tabWindows" class="tab-panel">
@@ -299,7 +300,7 @@
         <ul>
           <li>Rueda: <b>zoom</b>. Shift+rueda: horizontal. Alt+rueda: vertical.</li>
           <li>Espacio + arrastrar: <b>pan</b>.</li>
-          <li>Backend IA: <b>WebGPU</b> con modelo FP16.</li>
+          <li>Backend IA: <b>WebGPU</b>. Recomendado modelo FP16.</li>
         </ul>
       </div>
       <div id="tabKeys" class="tab-panel">
@@ -316,7 +317,7 @@
         <ul>
           <li>Procesamiento <b>local</b>, sin subir imágenes.</li>
           <li>Modelos cacheados en <b>IndexedDB</b>.</li>
-          <li>Editor: <b>pincel, rectángulo, lazo</b>.</li>
+          <li>Puedes cambiar entre <b>FP16</b> e <b>INT8</b> desde el sidebar.</li>
         </ul>
       </div>
     </div>

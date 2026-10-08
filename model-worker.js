@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════════════════
    model-worker.js — ONNX Runtime Web Worker para LAMA Inpainting
-   Fix: reporta bbox real de cada región
+   Compatible con FP16 e INT8 · reporta bbox real
    ═══════════════════════════════════════════════════════════════ */
 
 importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js');
@@ -539,7 +539,6 @@ async function runInference(imageData, maskData, width, height) {
     processWhole = true;
   }
 
-  // ⭐ Notificar al main thread: nº de regiones + dimensiones del bbox global
   self.postMessage({
     type: 'progress',
     stage: 'inference',
@@ -561,7 +560,6 @@ async function runInference(imageData, maskData, width, height) {
   for (let i = 0; i < regions.length; i++) {
     const r = regions[i];
 
-    // ⭐ Notificar con dimensiones REALES de esta región (antes de ajustar a 512)
     self.postMessage({
       type: 'progress',
       stage: 'region',

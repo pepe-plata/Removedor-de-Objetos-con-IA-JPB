@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════
    app.js — Removedor de Objetos con IA JPB
-   Modelo: lama_fp16.onnx (escritorio) / lama_int8.onnx (Android)
-   Fixes: limpiar máscara tras remover, mostrar bbox real, botón abrir
+   Modelos: LAMA FP16 / LAMA INT8 (seleccionables por el usuario)
+   Gestos: 2 dedos = pan O zoom (excluyentes)
    ═══════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -59,24 +59,33 @@ var state = {
 };
 
 /* ═══════════════════════════════════════════════════════════════
-   Modelos
+   Modelos disponibles
+   
+   - lama_fp16.onnx : ~107 MB · mejor calidad · WebGPU en PC
+   - lama_int8.onnx : ~62 MB  · buena calidad · más rápido en CPU/WASM
+   
+   El usuario puede elegir cualquiera desde el selector.
    ═══════════════════════════════════════════════════════════════ */
 var MODELS = [
   {
-    id: IS_ANDROID ? 'lama-int8' : 'lama-fp16',
-    name: IS_ANDROID ? 'LAMA INT8 (Móvil)' : 'LAMA FP16 (WebGPU)',
-    description: IS_ANDROID
-      ? 'Modelo cuantizado optimizado para CPU/WASM en Android'
-      : 'Modelo optimizado para WebGPU, sin fallbacks a CPU',
-    size: IS_ANDROID ? '~62 MB' : '~107 MB',
-    urls: IS_ANDROID
-      ? [
-          'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_int8.onnx'
-        ]
-      : [
-          'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx',
-          'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx'
-        ]
+    id: 'lama-fp16',
+    name: 'LAMA FP16 (Alta calidad)',
+    description: 'Mejor calidad, ideal para WebGPU en PC',
+    size: '~107 MB',
+    urls: [
+      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp16.onnx',
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx'
+    ]
+  },
+  {
+    id: 'lama-int8',
+    name: 'LAMA INT8 (Rápido en móvil)',
+    description: 'Menor tamaño y más rápido en CPU/WASM',
+    size: '~62 MB',
+    urls: [
+      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_int8.onnx',
+      'https://huggingface.co/g-ronimo/lama/resolve/main/lama.onnx'
+    ]
   }
 ];
 
@@ -124,8 +133,9 @@ function init() {
   createInternalCanvases(1, 1);
   syncThemeSwitch();
 
+  // Rellenar el selector de modelos con TODOS los modelos disponibles
   var modelSelect = $('#modelSelect');
-  if (modelSelect && MODELS.length > 0) {
+  if (modelSelect) {
     modelSelect.innerHTML = '';
     for (var i = 0; i < MODELS.length; i++) {
       var opt = document.createElement('option');
@@ -133,7 +143,8 @@ function init() {
       opt.textContent = MODELS[i].name;
       modelSelect.appendChild(opt);
     }
-    modelSelect.value = MODELS[0].id;
+    // Modelo por defecto según plataforma (pero el usuario puede cambiar)
+    modelSelect.value = IS_ANDROID ? 'lama-int8' : 'lama-fp16';
   }
 
   if (!window.JPBDB || !window.JPBDB.isAvailable || !window.JPBDB.isAvailable()) {
@@ -146,7 +157,7 @@ function init() {
   bindUI();
   bindCanvasEvents();
   bindKeyboard();
-  setupGlobalDelegation(); // ⭐ FIX botón "Seleccionar imagen"
+  setupGlobalDelegation();
   registerSW();
   checkSharedFiles();
 
@@ -167,13 +178,11 @@ function init() {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   ⭐ FIX: Delegación global para botones que abren el file input
-   Funciona incluso si el DOM cambia o hay overlays
+   Delegación global para botones que abren el file input
    ═══════════════════════════════════════════════════════════════ */
 function setupGlobalDelegation() {
   document.addEventListener('click', function (e) {
     var target = e.target;
-    // Buscar si el click fue en el botón o dentro de él
     while (target && target !== document) {
       if (target.id === 'openBtn' || target.id === 'emptySelect' ||
           (target.dataset && target.dataset.action === 'open')) {
@@ -185,7 +194,7 @@ function setupGlobalDelegation() {
       }
       target = target.parentNode;
     }
-  }, true); // capture=true para asegurar que se ejecute antes que otros handlers
+  }, true);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -275,11 +284,9 @@ function bindUI() {
   if (helpBtn && helpModal) helpBtn.addEventListener('click', function () { openModal(helpModal); });
 
   var saveBtn = $('#saveBtn');
-  var openBtn = $('#openBtn');
   var fileInput = $('#fileInput');
 
   if (saveBtn) saveBtn.addEventListener('click', function () { if (canSave()) openSaveModal(); });
-  // Nota: openBtn y emptySelect se manejan con delegación global
 
   if (fileInput) {
     fileInput.addEventListener('change', function (e) {
@@ -394,6 +401,7 @@ function bindUI() {
     modelSelect2.addEventListener('change', function () {
       state.modelLoaded = false;
       state.modelLoadedId = null;
+      setStatus('Modelo cambiado a: ' + (getModelById(modelSelect2.value) || {}).name);
     });
   }
 
@@ -403,7 +411,7 @@ function bindUI() {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Canvas eventos
+   Canvas eventos (dibujo, pan, zoom, gestos táctiles)
    ═══════════════════════════════════════════════════════════════ */
 function bindCanvasEvents() {
   var canvasWrap = $('#canvasWrap');
@@ -412,9 +420,25 @@ function bindCanvasEvents() {
   var pointers = new Map();
   var isPanning = false;
   var panStart = null;
-  var pinchStart = null;
   var pendingDrawTimer = null;
   var spaceDown = false;
+
+  // Estado para gestos de 2 dedos
+  var gesture = {
+    active: false,
+    mode: null,          // 'pinch' | 'pan' | null
+    startDist: 0,
+    startZoom: 1,
+    startMidX: 0,
+    startMidY: 0,
+    startOffsetX: 0,
+    startOffsetY: 0,
+    // Referencia inicial de cada dedo
+    p1StartX: 0,
+    p1StartY: 0,
+    p2StartX: 0,
+    p2StartY: 0
+  };
 
   canvasWrap.addEventListener('pointerdown', onPointerDown);
   canvasWrap.addEventListener('pointermove', onPointerMove);
@@ -446,9 +470,10 @@ function bindCanvasEvents() {
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (pointers.size === 2) {
+      // Cancelar cualquier dibujo pendiente
       if (pendingDrawTimer) { clearTimeout(pendingDrawTimer); pendingDrawTimer = null; }
       cancelDrawing();
-      startPinch();
+      startGesture();
       return;
     }
 
@@ -475,7 +500,10 @@ function bindCanvasEvents() {
     if (!pointers.has(e.pointerId)) return;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    if (pointers.size === 2) { updatePinch(); return; }
+    if (pointers.size === 2) {
+      updateGesture();
+      return;
+    }
 
     if (isPanning && panStart) {
       state.offsetX = e.clientX - panStart.x;
@@ -494,7 +522,10 @@ function bindCanvasEvents() {
 
   function onPointerUp(e) {
     pointers.delete(e.pointerId);
-    if (pointers.size < 2) pinchStart = null;
+    if (pointers.size < 2) {
+      gesture.active = false;
+      gesture.mode = null;
+    }
 
     if (pendingDrawTimer) { clearTimeout(pendingDrawTimer); pendingDrawTimer = null; }
 
@@ -517,33 +548,94 @@ function bindCanvasEvents() {
     zoomAt(e.clientX, e.clientY, newZoom);
   }
 
-  function startPinch() {
+  /* ─── Gestos de 2 dedos ─── */
+  function startGesture() {
     var pts = Array.from(pointers.values());
+    if (pts.length < 2) return;
+
     var dx = pts[0].x - pts[1].x;
     var dy = pts[0].y - pts[1].y;
     var dist = Math.hypot(dx, dy);
-    pinchStart = { dist: dist, zoom: state.zoom };
+
+    gesture.active = true;
+    gesture.mode = null;   // se decide en el primer move
+    gesture.startDist = dist;
+    gesture.startZoom = state.zoom;
+    gesture.startMidX = (pts[0].x + pts[1].x) / 2;
+    gesture.startMidY = (pts[0].y + pts[1].y) / 2;
+    gesture.startOffsetX = state.offsetX;
+    gesture.startOffsetY = state.offsetY;
+    gesture.p1StartX = pts[0].x;
+    gesture.p1StartY = pts[0].y;
+    gesture.p2StartX = pts[1].x;
+    gesture.p2StartY = pts[1].y;
   }
 
-  function updatePinch() {
-    if (!pinchStart) return;
+  function updateGesture() {
+    if (!gesture.active) return;
     var pts = Array.from(pointers.values());
+    if (pts.length < 2) return;
+
     var dx = pts[0].x - pts[1].x;
     var dy = pts[0].y - pts[1].y;
     var dist = Math.hypot(dx, dy);
-    var scale = dist / pinchStart.dist;
-    var newZoom = Math.max(0.05, Math.min(20, pinchStart.zoom * scale));
 
-    var rect = canvasWrap.getBoundingClientRect();
-    var cx = (pts[0].x + pts[1].x) / 2 - rect.left;
-    var cy = (pts[0].y + pts[1].y) / 2 - rect.top;
-    var k = newZoom / state.zoom;
-    state.offsetX = cx - (cx - state.offsetX) * k;
-    state.offsetY = cy - (cy - state.offsetY) * k;
-    state.zoom = newZoom;
-    updateTransform();
+    var midX = (pts[0].x + pts[1].x) / 2;
+    var midY = (pts[0].y + pts[1].y) / 2;
+
+    // Desplazamiento del centro (indica pan)
+    var midDx = midX - gesture.startMidX;
+    var midDy = midY - gesture.startMidY;
+    var midMove = Math.hypot(midDx, midDy);
+
+    // Cambio de distancia (indica zoom)
+    var distDelta = Math.abs(dist - gesture.startDist);
+    var distRatio = dist / gesture.startDist;
+
+    // ─── DECISIÓN DE MODO (solo la primera vez) ───
+    if (gesture.mode === null) {
+      // Umbrales para decidir intención
+      var ZOOM_THRESHOLD = 8;    // px de cambio en la distancia entre dedos
+      var PAN_THRESHOLD = 8;     // px de movimiento del centro
+
+      // ¿El usuario está claramente haciendo zoom?
+      var isZoomIntent = distDelta > ZOOM_THRESHOLD && distDelta > midMove * 0.8;
+
+      // ¿El usuario está claramente haciendo pan?
+      var isPanIntent = midMove > PAN_THRESHOLD && distDelta < ZOOM_THRESHOLD * 0.6;
+
+      if (isZoomIntent) {
+        gesture.mode = 'pinch';
+      } else if (isPanIntent) {
+        gesture.mode = 'pan';
+      }
+      // Si no se decide aún, no hacemos nada (esperamos más movimiento)
+    }
+
+    // ─── EJECUTAR SOLO EL MODO ACTIVO (nunca ambos) ───
+    if (gesture.mode === 'pinch') {
+      var newZoom = Math.max(0.05, Math.min(20, gesture.startZoom * distRatio));
+
+      var rect = canvasWrap.getBoundingClientRect();
+      // Zoom centrado en la posición inicial del centro (más estable)
+      var cx = gesture.startMidX - rect.left;
+      var cy = gesture.startMidY - rect.top;
+
+      var k = newZoom / gesture.startZoom;
+      state.offsetX = cx - (cx - gesture.startOffsetX) * k;
+      state.offsetY = cy - (cy - gesture.startOffsetY) * k;
+      state.zoom = newZoom;
+      updateTransform();
+    } else if (gesture.mode === 'pan') {
+      // Pan: mover usando el desplazamiento del centro de los dedos
+      state.offsetX = gesture.startOffsetX + midDx;
+      state.offsetY = gesture.startOffsetY + midDy;
+      updateTransform();
+    }
+    // Si mode es null: no hacer nada (esperar a que se decida)
   }
 
+  /* ─── Dibujo ─── */
   function startDrawing(e) {
     if (!state.imgWidth) return;
     if (!state.history.length) saveMaskSnapshot();
@@ -1024,7 +1116,6 @@ function onWorkerMessage(ev) {
   if (!msg) return;
 
   if (typeof msg.id === 'undefined') {
-    // ⭐ FIX: mostrar dimensiones reales de la región
     if (msg.type === 'progress' && msg.stage === 'region') {
       var progressInfo = $('#progressInfo');
       var progressFill = $('#progressFill');
@@ -1183,7 +1274,7 @@ async function runAI() {
     if (res && res.imageData) {
       state.currentCtx.putImageData(res.imageData, 0, 0);
 
-      // ⭐ FIX: limpiar la máscara tras remover
+      // Limpiar la máscara tras remover
       state.maskCtx.clearRect(0, 0, state.imgWidth, state.imgHeight);
       state.history = [];
       state.historyIndex = -1;
@@ -1216,6 +1307,7 @@ async function downloadModelWithFallback(modelId) {
   var lastErr = null;
   for (var i = 0; i < model.urls.length; i++) {
     try {
+      console.log('[JPB] Intentando descargar: ' + model.urls[i]);
       return await downloadWithProgress(model.urls[i], model.name);
     } catch (e) {
       lastErr = e;
