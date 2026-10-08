@@ -1,13 +1,15 @@
 /* ═══════════════════════════════════════════════════════════════
    model-worker.js — ONNX Runtime Web Worker
    
-   Soporta DOS modelos leyendo el tipo de dato REAL de cada input:
-     - LAMA  → inputs "image" y "mask" en float32 (0..1)
-     - MIGAN → inputs "image" y "mask" en uint8 (0..255)
+   Soporta LaMa (float32) y MIGAN (uint8) con auto-recuperación:
    
-   El detector lee session.inputMetadata[name].type para saber si
-   construir tensores float32 o uint8. Ya no adivina por el número
-   de canales, sino por el tipo real que espera el modelo.
+   ⚠ BUG de ORT Web 1.17: inputMetadata.type puede mentir para
+   modelos con dims dinámicas + cuantización. El tipo reportado
+   (tensor(float)) no siempre coincide con el tipo real (uint8).
+   
+   SOLUCIÓN: si la primera inferencia falla con "Unexpected input
+   data type", reintentamos con el dtype opuesto automáticamente
+   y recordamos cuál funciona.
    ═══════════════════════════════════════════════════════════════ */
 
 importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js');
@@ -23,20 +25,22 @@ let useWebGPU = false;
 let currentSession = null;
 let currentModelId = null;
 
-// Metadata completa del modelo (se rellena en detectModelType)
+// Metadata completa del modelo
 let modelInfo = {
   inputImageName: null,
   inputMaskName: null,
   imageChannels: 3,
-  imageDtype: 'float32',      // 'float32' | 'uint8'
-  maskDtype: 'float32',       // 'float32' | 'uint8'
+  imageDtype: 'float32',
+  imageDtypeOverride: null,    // dtype REAL que funcionó (si hubo override)
+  maskDtype: 'float32',
   hasSeparateMask: false,
-  imageFixedSize: null,       // { h, w } si es fijo, null si dinámico
-  maskMeaning: 'eliminate',   // 'eliminate' (LaMa: 1=eliminar) | 'keep' (MIGAN: 255=conservar)
-  type: 'unknown'             // 'lama' | 'migan' | 'unknown'
+  imageFixedSize: null,
+  maskMeaning: 'eliminate',
+  type: 'unknown'
 };
 
 const PAD_USER = 25;
+const DEFAULT_LAMA_SIZE = 512;
 
 function alignTo32(v) {
   return Math.max(32, Math.ceil(v / 32) * 32);
@@ -81,6 +85,13 @@ function serializeError(err) {
     if (s && s !== '[object Object]') return s;
   } catch (_) {}
   return 'Error no serializable (typeof=' + typeof err + ')';
+}
+
+/* Detectar si un error es de "tipo de dato incorrecto" */
+function isDtypeError(errMsg) {
+  if (!errMsg) return false;
+  var m = errMsg.toLowerCase();
+  return m.indexOf('unexpected input data type') >= 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -162,7 +173,7 @@ function findRegions(maskData, width, height) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Detección completa del modelo: nombres, canales, DTYPE y tamaño.
+   Detección del modelo
    ═══════════════════════════════════════════════════════════════ */
 function detectModelType(session) {
   modelInfo = {
@@ -170,6 +181,7 @@ function detectModelType(session) {
     inputMaskName: null,
     imageChannels: 3,
     imageDtype: 'float32',
+    imageDtypeOverride: null,
     maskDtype: 'float32',
     hasSeparateMask: false,
     imageFixedSize: null,
@@ -180,23 +192,32 @@ function detectModelType(session) {
   var inputs = session.inputNames;
   var meta = session.inputMetadata || {};
 
-  // 1) Buscar por canales: el de 3 canales es la imagen, el de 1 la máscara
+  console.log('[worker] ═══ Inspeccionando inputs ═══');
+
+  var fixedH = 0, fixedW = 0;
+
   for (var i = 0; i < inputs.length; i++) {
     var name = inputs[i];
     var info = meta[name] || {};
     var dims = info.dimensions ? info.dimensions.slice() : null;
     var dtype = info.type || 'tensor(float)';
 
+    console.log('[worker]   input[' + i + '] "' + name + '" dims=' +
+                JSON.stringify(dims) + ' type=' + dtype);
+
     if (!dims || dims.length !== 4) continue;
+
+    if (typeof dims[2] === 'number' && dims[2] > 0 &&
+        typeof dims[3] === 'number' && dims[3] > 0) {
+      fixedH = dims[2];
+      fixedW = dims[3];
+    }
 
     var ch = dims[1];
     if ((ch === 3 || ch === 4) && !modelInfo.inputImageName) {
       modelInfo.inputImageName = name;
       modelInfo.imageChannels = ch;
       modelInfo.imageDtype = parseDtype(dtype);
-      if (dims[2] > 0 && dims[3] > 0) {
-        modelInfo.imageFixedSize = { h: dims[2], w: dims[3] };
-      }
     } else if (ch === 1 && !modelInfo.inputMaskName) {
       modelInfo.inputMaskName = name;
       modelInfo.maskDtype = parseDtype(dtype);
@@ -204,21 +225,14 @@ function detectModelType(session) {
     }
   }
 
-  // 2) Fallback por nombre
+  // Fallback por nombre
   if (!modelInfo.inputImageName) {
     for (var j = 0; j < inputs.length; j++) {
       var ln = inputs[j].toLowerCase();
       if (ln.indexOf('image') >= 0 || ln.indexOf('img') >= 0) {
         var info2 = meta[inputs[j]] || {};
-        var dims2 = info2.dimensions ? info2.dimensions.slice() : null;
         modelInfo.inputImageName = inputs[j];
         modelInfo.imageDtype = parseDtype(info2.type || 'tensor(float)');
-        if (dims2 && dims2.length === 4) {
-          modelInfo.imageChannels = dims2[1] || 3;
-          if (dims2[2] > 0 && dims2[3] > 0) {
-            modelInfo.imageFixedSize = { h: dims2[2], w: dims2[3] };
-          }
-        }
         break;
       }
     }
@@ -236,9 +250,7 @@ function detectModelType(session) {
     }
   }
 
-  // 3) Determinar tipo y semántica de la máscara
-  //    Regla: si ambos inputs son float32 → LaMa (máscara 1=eliminar)
-  //           si ambos inputs son uint8   → MIGAN (máscara 255=conservar)
+  // Tipo de modelo según dtype reportado
   if (modelInfo.imageDtype === 'uint8') {
     modelInfo.type = 'migan';
     modelInfo.maskMeaning = 'keep';
@@ -247,19 +259,28 @@ function detectModelType(session) {
     modelInfo.maskMeaning = 'eliminate';
   }
 
-  console.log('[worker] Modelo detectado: ' + modelInfo.type);
-  console.log('  inputImage:', modelInfo.inputImageName,
-              'ch=' + modelInfo.imageChannels,
-              'dtype=' + modelInfo.imageDtype,
-              'fixed=' + JSON.stringify(modelInfo.imageFixedSize));
-  console.log('  inputMask:', modelInfo.inputMaskName,
-              'dtype=' + modelInfo.maskDtype,
-              'hasSep=' + modelInfo.hasSeparateMask);
-  console.log('  maskMeaning:', modelInfo.maskMeaning);
+  // Tamaño fijo
+  if (fixedH > 0 && fixedW > 0) {
+    modelInfo.imageFixedSize = { h: fixedH, w: fixedW };
+  } else if (modelInfo.type === 'lama') {
+    modelInfo.imageFixedSize = { h: DEFAULT_LAMA_SIZE, w: DEFAULT_LAMA_SIZE };
+  } else {
+    modelInfo.imageFixedSize = null;
+  }
+
+  console.log('[worker] ═══ Detección final ═══');
+  console.log('[worker]   Tipo:', modelInfo.type);
+  console.log('[worker]   image:', modelInfo.inputImageName,
+              '· ch=' + modelInfo.imageChannels,
+              '· dtype=' + modelInfo.imageDtype);
+  console.log('[worker]   mask:', modelInfo.inputMaskName,
+              '· dtype=' + modelInfo.maskDtype,
+              '· hasSep=' + modelInfo.hasSeparateMask);
+  console.log('[worker]   fixed:', JSON.stringify(modelInfo.imageFixedSize));
+  console.log('[worker]   maskMeaning:', modelInfo.maskMeaning);
 }
 
 function parseDtype(ortType) {
-  // ORT devuelve strings como 'tensor(float)', 'tensor(uint8)', 'tensor(float16)'
   if (!ortType) return 'float32';
   var t = ortType.toLowerCase();
   if (t.indexOf('uint8') >= 0) return 'uint8';
@@ -308,40 +329,32 @@ function tensorToImageData(tensor, width, height) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Construcción de tensores según dtype esperado
+   Construcción de tensores (con dtype forzable)
    ═══════════════════════════════════════════════════════════════ */
-
-/** Convierte un Uint8ClampedArray RGBA (imagen) al dtype esperado. */
-function buildImageTensorFromRGBA(imgPx, maskPx, width, height) {
+function buildImageTensorFromRGBA(imgPx, maskPx, width, height, forceDtype) {
   var size = width * height;
-  var dtype = modelInfo.imageDtype;
+  var dtype = forceDtype || modelInfo.imageDtype;
   var channels = modelInfo.imageChannels;
-  var maskIsKeep = (modelInfo.maskMeaning === 'keep');
 
   if (dtype === 'uint8') {
-    // ---- MIGAN: uint8 ----
-    // La imagen se envía tal cual (0..255).
-    // La máscara se envía con su semántica (255=conservar, 0=eliminar).
     var imgData = new Uint8Array(channels * size);
     var maskData = new Uint8Array(size);
 
     for (var i = 0; i < size; i++) {
       var i4 = i * 4;
-      imgData[i]              = imgPx[i4];
-      imgData[size + i]       = imgPx[i4 + 1];
-      imgData[2 * size + i]   = imgPx[i4 + 2];
-      // Nuestra UI: 255 = eliminar. MIGAN: 0 = eliminar.
-      // Así que invertimos.
+      imgData[i]            = imgPx[i4];
+      imgData[size + i]     = imgPx[i4 + 1];
+      imgData[2 * size + i] = imgPx[i4 + 2];
+      // MIGAN: invertir (blanco del usuario = 0 = eliminar)
       maskData[i] = maskPx[i4] > 127 ? 0 : 255;
     }
-
     return {
       image: new ort.Tensor('uint8', imgData, [1, channels, height, width]),
       mask: new ort.Tensor('uint8', maskData, [1, 1, height, width])
     };
   }
 
-  // ---- LaMa y similares: float32 ----
+  // float32
   var f;
   if (channels === 4) {
     f = new Float32Array(4 * size);
@@ -363,7 +376,6 @@ function buildImageTensorFromRGBA(imgPx, maskPx, width, height) {
     };
   }
 
-  // channels === 3
   f = new Float32Array(3 * size);
   for (var q = 0; q < size; q++) {
     var q4 = q * 4;
@@ -377,7 +389,6 @@ function buildImageTensorFromRGBA(imgPx, maskPx, width, height) {
     }
   }
 
-  // Si el modelo espera máscara separada, también la construimos
   var maskTensor = null;
   if (modelInfo.hasSeparateMask) {
     var mf = new Float32Array(size);
@@ -394,17 +405,14 @@ function buildImageTensorFromRGBA(imgPx, maskPx, width, height) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Cálculo de geometría del crop
+   Geometría del crop
    ═══════════════════════════════════════════════════════════════ */
 function computeCropGeometry(bbox, imgW, imgH, fixedSize) {
   var cropW, cropH;
 
   if (fixedSize) {
-    var side = Math.max(bbox.w, bbox.h) + PAD_USER * 2;
-    if (side < 64) side = 64;
-    if (side > fixedSize.w) side = fixedSize.w;
-    cropW = side;
-    cropH = side;
+    cropW = fixedSize.w;
+    cropH = fixedSize.h;
   } else {
     cropW = alignTo32(bbox.w + PAD_USER * 2);
     cropH = alignTo32(bbox.h + PAD_USER * 2);
@@ -421,17 +429,7 @@ function computeCropGeometry(bbox, imgW, imgH, fixedSize) {
   if (cropX + cropW > imgW) cropX = Math.max(0, imgW - cropW);
   if (cropY + cropH > imgH) cropY = Math.max(0, imgH - cropH);
 
-  var realW = Math.min(cropW, imgW - cropX);
-  var realH = Math.min(cropH, imgH - cropY);
-
-  if (!fixedSize) {
-    realW = alignTo32(realW);
-    realH = alignTo32(realH);
-    if (cropX + realW > imgW) realW = Math.max(32, imgW - cropX);
-    if (cropY + realH > imgH) realH = Math.max(32, imgH - cropY);
-  }
-
-  return { x: cropX, y: cropY, w: realW, h: realH };
+  return { x: cropX, y: cropY, w: cropW, h: cropH };
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -563,6 +561,69 @@ async function loadSession(modelArrayBuffer, modelId) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   ⭐ Inferencia con auto-recuperación de dtype
+   
+   1) Intenta con el dtype reportado por metadata.
+   2) Si falla con "Unexpected input data type", reintenta con el
+      dtype opuesto y recuerda cuál funcionó para próximas veces.
+   ═══════════════════════════════════════════════════════════════ */
+async function runInferenceWithFallback(geom, cropImg, cropMask) {
+  // Decidir orden de intentos
+  var startDtype = modelInfo.imageDtypeOverride || modelInfo.imageDtype;
+  var altDtype = (startDtype === 'uint8') ? 'float32' : 'uint8';
+
+  var tryOrder = modelInfo.imageDtypeOverride
+    ? [modelInfo.imageDtypeOverride]
+    : [startDtype, altDtype];
+
+  var lastErr = null;
+
+  for (var i = 0; i < tryOrder.length; i++) {
+    var dt = tryOrder[i];
+    console.log('[worker] Inferencia con dtype=' + dt +
+                ' (metadata=' + modelInfo.imageDtype + ')');
+
+    var tensors = buildImageTensorFromRGBA(cropImg, cropMask, geom.w, geom.h, dt);
+
+    var feeds = {};
+    feeds[modelInfo.inputImageName] = tensors.image;
+    if (modelInfo.inputMaskName && tensors.mask) {
+      feeds[modelInfo.inputMaskName] = tensors.mask;
+    }
+
+    try {
+      var t0 = Date.now();
+      var results = await currentSession.run(feeds);
+      var dtms = ((Date.now() - t0) / 1000).toFixed(2);
+      console.log('[worker] ✓ Inferencia OK con dtype=' + dt + ' en ' + dtms + 's');
+
+      // Guardar override si el dtype usado difiere del metadata
+      if (!modelInfo.imageDtypeOverride && dt !== modelInfo.imageDtype) {
+        modelInfo.imageDtypeOverride = dt;
+        console.log('[worker] ⚠ Override de dtype guardado: ' + dt +
+                    ' (metadata reportaba ' + modelInfo.imageDtype + ')');
+      }
+
+      return results;
+    } catch (err) {
+      var msg = serializeError(err);
+      lastErr = msg;
+
+      if (isDtypeError(msg) && i < tryOrder.length - 1) {
+        console.warn('[worker] Fallo por dtype. Reintentando con ' +
+                     tryOrder[i + 1] + '...');
+        continue;
+      }
+
+      // Si no es error de dtype o ya no quedan intentos, propagar
+      throw new Error(msg);
+    }
+  }
+
+  throw new Error('Todos los intentos fallaron. Último: ' + lastErr);
+}
+
+/* ═══════════════════════════════════════════════════════════════
    Inferencia sobre una región
    ═══════════════════════════════════════════════════════════════ */
 async function runOnRegion(imageData, maskFull, imgW, imgH, bbox) {
@@ -571,30 +632,15 @@ async function runOnRegion(imageData, maskFull, imgW, imgH, bbox) {
 
   console.log('[worker] Crop=' + geom.w + '×' + geom.h +
               ' en (' + geom.x + ',' + geom.y + ')' +
-              ' · tipo=' + modelInfo.type +
-              ' · dtype=' + modelInfo.imageDtype);
+              ' · tipo=' + modelInfo.type);
 
   var cropImg = extractCrop(imageData, imgW, imgH, geom);
   var cropMask = extractMaskCrop(maskFull, imgW, imgH, geom);
 
-  var tensors = buildImageTensorFromRGBA(cropImg, cropMask, geom.w, geom.h);
-
-  // Construir feeds
-  var feeds = {};
-  feeds[modelInfo.inputImageName] = tensors.image;
-  if (modelInfo.inputMaskName && tensors.mask) {
-    feeds[modelInfo.inputMaskName] = tensors.mask;
-  }
+  var results = await runInferenceWithFallback(geom, cropImg, cropMask);
 
   cropImg = null;
   cropMask = null;
-
-  var t0 = Date.now();
-  var results = await currentSession.run(feeds);
-  var dt = ((Date.now() - t0) / 1000).toFixed(2);
-  console.log('[worker] Inferencia OK en ' + dt + 's');
-
-  feeds = null;
 
   // Convertir salida
   var outKey = currentSession.outputNames[0] || Object.keys(results)[0];
@@ -605,7 +651,6 @@ async function runOnRegion(imageData, maskFull, imgW, imgH, bbox) {
 
   var resultImg = tensorToImageData(outTensor, outW, outH);
 
-  // Recortar si la salida es mayor que el crop
   var finalW = Math.min(outW, geom.w);
   var finalH = Math.min(outH, geom.h);
 

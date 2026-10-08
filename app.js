@@ -70,29 +70,59 @@ var state = {
    
    La lista se filtra según la plataforma detectada.
    ═══════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════
+   Modelos disponibles
+   
+   - LAMA FP32 → alta precisión, 210 MB (Windows principal)
+   - LAMA FP16 → mitad de tamaño, buena calidad (fallback ligero)
+   - MIGAN     → móvil-friendly, dims dinámicas, 28 MB (Android)
+   
+   El worker detecta automáticamente el dtype correcto y hace
+   auto-recuperación si la metadata miente.
+   ═══════════════════════════════════════════════════════════════ */
 var ALL_MODELS = {
+  'lama-fp32': {
+    id: 'lama-fp32',
+    name: 'LAMA FP32 (Alta precisión)',
+    description: 'Modelo completo · mejor calidad',
+    size: '~210 MB',
+    minBytes: 180 * 1024 * 1024,
+    urls: [
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx',
+      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp32.onnx'
+    ]
+  },
+  'lama-fp16': {
+    id: 'lama-fp16',
+    name: 'LAMA FP16 (Más ligero)',
+    description: 'Mitad de tamaño que FP32, ligeramente menor precisión',
+    size: '~110 MB',
+    minBytes: 90 * 1024 * 1024,
+    urls: [
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx',
+      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp16.onnx'
+    ]
+  },
   'migan': {
     id: 'migan',
     name: 'MIGAN (Rápido · Android)',
-    description: 'Modelo ligero optimizado para móvil · dimensiones dinámicas',
+    description: 'Modelo móvil de inpainting (28 MB)',
     size: '~28 MB',
     minBytes: 20 * 1024 * 1024,
     urls: [
       'https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx'
     ]
-  },
-  'lama-fp32': {
-    id: 'lama-fp32',
-    name: 'LAMA FP32 (Alta precisión · Windows)',
-    description: 'Modelo completo · mejor calidad',
-    size: '~210 MB',
-    minBytes: 180 * 1024 * 1024,
-    urls: [
-      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp32.onnx',
-      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx'
-    ]
   }
 };
+
+var MODELS;
+if (IS_ANDROID) {
+  // Android: MIGAN por defecto, fallbacks LAMA
+  MODELS = [ALL_MODELS['migan'], ALL_MODELS['lama-fp16'], ALL_MODELS['lama-fp32']];
+} else {
+  // Escritorio: LAMA FP32 por defecto, MIGAN como opción secundaria
+  MODELS = [ALL_MODELS['lama-fp32'], ALL_MODELS['lama-fp16'], ALL_MODELS['migan']];
+}
 
 // Filtro por plataforma
 var MODELS;
