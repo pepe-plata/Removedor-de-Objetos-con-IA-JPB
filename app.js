@@ -1,6 +1,10 @@
 /* ═══════════════════════════════════════════════════════════════
    app.js — Removedor de Objetos con IA JPB
-   Modelos: LAMA FP16 / LAMA INT8 desde Carve/LaMa-ONNX
+   
+   Modelos dinámicos (acepta H×W múltiplos de 32):
+     - lama_fp16.onnx (recomendado)
+     - lama_fp32.onnx (alta precisión)
+   
    Gestos: 2 dedos = pan O zoom (excluyentes)
    ═══════════════════════════════════════════════════════════════ */
 
@@ -59,29 +63,36 @@ var state = {
 };
 
 /* ═══════════════════════════════════════════════════════════════
-   Modelos disponibles — Repo Carve/LaMa-ONNX (URLs verificadas)
+   Modelos disponibles
+   
+   Usamos los exports DINÁMICOS de LaMa (acepta H×W múltiplos de 32).
+   URLs verificadas del repo g-ronimo/lama con fallback a Carve.
+   
+   Ventaja del modelo dinámico: procesa SOLO el área pintada
+   (redondeada a múltiplo de 32), lo que reduce drásticamente la
+   memoria usada en Android → evita errores OOM.
    ═══════════════════════════════════════════════════════════════ */
 var MODELS = [
   {
     id: 'lama-fp16',
-    name: 'LAMA FP16 (Alta calidad)',
-    description: 'Mejor calidad, ideal para WebGPU en PC',
-    size: '~107 MB',
+    name: 'LAMA FP16 (Recomendado)',
+    description: 'Modelo dinámico · procesa solo el área pintada',
+    size: '~110 MB',
     minBytes: 90 * 1024 * 1024,
     urls: [
-      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx',
-      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx'
+      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp16.onnx',
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx'
     ]
   },
   {
-    id: 'lama-int8',
-    name: 'LAMA INT8 (Rápido en móvil)',
-    description: 'Menor tamaño y más rápido en CPU/WASM',
-    size: '~62 MB',
-    minBytes: 50 * 1024 * 1024,
+    id: 'lama-fp32',
+    name: 'LAMA FP32 (Alta precisión)',
+    description: 'Modelo dinámico · más lento pero más preciso',
+    size: '~210 MB',
+    minBytes: 180 * 1024 * 1024,
     urls: [
-      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_int8.onnx',
-      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx'
+      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp32.onnx',
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx'
     ]
   }
 ];
@@ -89,6 +100,14 @@ var MODELS = [
 function getModelById(id) {
   for (var i = 0; i < MODELS.length; i++) if (MODELS[i].id === id) return MODELS[i];
   return null;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Alinea un valor al múltiplo de 32 más cercano hacia arriba.
+   Necesario porque LaMa dinámico requiere H y W múltiplos de 32.
+   ═══════════════════════════════════════════════════════════════ */
+function alignTo32(value) {
+  return Math.max(32, Math.ceil(value / 32) * 32);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -150,6 +169,7 @@ function init() {
   createInternalCanvases(1, 1);
   syncThemeSwitch();
 
+  // Rellenar selector de modelos
   var modelSelect = $('#modelSelect');
   if (modelSelect) {
     modelSelect.innerHTML = '';
@@ -159,7 +179,7 @@ function init() {
       opt.textContent = MODELS[i].name;
       modelSelect.appendChild(opt);
     }
-    modelSelect.value = IS_ANDROID ? 'lama-int8' : 'lama-fp16';
+    modelSelect.value = 'lama-fp16';
   }
 
   if (!window.JPBDB || !window.JPBDB.isAvailable || !window.JPBDB.isAvailable()) {
@@ -1351,7 +1371,7 @@ async function downloadWithProgress(url, modelName) {
   var contentType = (resp.headers.get('content-type') || '').toLowerCase();
   if (contentType.indexOf('text/html') >= 0) {
     closeModal(progressModal);
-    throw new Error('La URL devolvió HTML, no un ONNX. Verifica la URL del modelo.');
+    throw new Error('La URL devolvió HTML, no un ONNX.');
   }
 
   var total = +(resp.headers.get('content-length') || 0);
