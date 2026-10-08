@@ -1,11 +1,13 @@
 /* ═══════════════════════════════════════════════════════════════
    model-worker.js — ONNX Runtime Web Worker
    
-   Soporta DOS modelos:
-     - LAMA (LaMa-ONNX) → input [1,4,H,W] con RGB+máscara concatenada
-     - MIGAN            → inputs separados image [1,3,H,W] + mask [1,1,H,W]
+   Soporta DOS modelos leyendo el tipo de dato REAL de cada input:
+     - LAMA  → inputs "image" y "mask" en float32 (0..1)
+     - MIGAN → inputs "image" y "mask" en uint8 (0..255)
    
-   Detección automática del tipo según la metadata de la sesión.
+   El detector lee session.inputMetadata[name].type para saber si
+   construir tensores float32 o uint8. Ya no adivina por el número
+   de canales, sino por el tipo real que espera el modelo.
    ═══════════════════════════════════════════════════════════════ */
 
 importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js');
@@ -20,22 +22,22 @@ let forceWasm = WORKER_IS_ANDROID;
 let useWebGPU = false;
 let currentSession = null;
 let currentModelId = null;
-let currentModelType = null;  // 'lama' | 'migan' | 'unknown'
 
-// Metadata detectada del modelo
+// Metadata completa del modelo (se rellena en detectModelType)
 let modelInfo = {
-  type: 'unknown',
   inputImageName: null,
   inputMaskName: null,
-  inputChannels: 3,       // 3 o 4 canales para el input de imagen
-  fixedSize: null,        // null si es dinámico, [H, W] si es fijo
-  maskInverted: false     // MIGAN usa 255=conocido, 0=eliminar (inverso a LaMa)
+  imageChannels: 3,
+  imageDtype: 'float32',      // 'float32' | 'uint8'
+  maskDtype: 'float32',       // 'float32' | 'uint8'
+  hasSeparateMask: false,
+  imageFixedSize: null,       // { h, w } si es fijo, null si dinámico
+  maskMeaning: 'eliminate',   // 'eliminate' (LaMa: 1=eliminar) | 'keep' (MIGAN: 255=conservar)
+  type: 'unknown'             // 'lama' | 'migan' | 'unknown'
 };
 
-// Padding alrededor del bbox pintado por el usuario
 const PAD_USER = 25;
 
-// Tamaño mínimo alineable (múltiplo de 32)
 function alignTo32(v) {
   return Math.max(32, Math.ceil(v / 32) * 32);
 }
@@ -43,7 +45,7 @@ function alignTo32(v) {
 console.log('[worker] Iniciado. Android=' + WORKER_IS_ANDROID);
 
 /* ═══════════════════════════════════════════════════════════════
-   Serialización robusta de errores
+   Serialización de errores
    ═══════════════════════════════════════════════════════════════ */
 function serializeError(err) {
   if (err === null) return 'Error: null';
@@ -82,7 +84,7 @@ function serializeError(err) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Mensajes de control
+   Control
    ═══════════════════════════════════════════════════════════════ */
 self.addEventListener('message', function (e) {
   if (!e.data || !e.data.type) return;
@@ -160,92 +162,111 @@ function findRegions(maskData, width, height) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Detección del modelo (LaMa vs MIGAN)
-   
-   - LaMa:  input único [1, 4, H, W] con RGB+máscara concatenada
-   - MIGAN: inputs separados image [1, 3, H, W] + mask [1, 1, H, W]
-            donde mask=255 significa "conocido" y mask=0 "eliminar"
+   Detección completa del modelo: nombres, canales, DTYPE y tamaño.
    ═══════════════════════════════════════════════════════════════ */
 function detectModelType(session) {
+  modelInfo = {
+    inputImageName: null,
+    inputMaskName: null,
+    imageChannels: 3,
+    imageDtype: 'float32',
+    maskDtype: 'float32',
+    hasSeparateMask: false,
+    imageFixedSize: null,
+    maskMeaning: 'eliminate',
+    type: 'unknown'
+  };
+
   var inputs = session.inputNames;
   var meta = session.inputMetadata || {};
 
-  modelInfo = {
-    type: 'unknown',
-    inputImageName: null,
-    inputMaskName: null,
-    inputChannels: 3,
-    fixedSize: null,
-    maskInverted: false
-  };
-
-  var foundImage = null;
-  var foundMask = null;
-  var imageChannels = 3;
-  var imageDims = null;
-
+  // 1) Buscar por canales: el de 3 canales es la imagen, el de 1 la máscara
   for (var i = 0; i < inputs.length; i++) {
     var name = inputs[i];
-    var info = meta[name];
-    var dims = info && info.dimensions ? info.dimensions.slice() : null;
+    var info = meta[name] || {};
+    var dims = info.dimensions ? info.dimensions.slice() : null;
+    var dtype = info.type || 'tensor(float)';
+
     if (!dims || dims.length !== 4) continue;
 
     var ch = dims[1];
-    if ((ch === 4 || ch === 3) && !foundImage) {
-      foundImage = name;
-      imageChannels = ch;
-      imageDims = dims;
-    } else if (ch === 1 && !foundMask) {
-      foundMask = name;
+    if ((ch === 3 || ch === 4) && !modelInfo.inputImageName) {
+      modelInfo.inputImageName = name;
+      modelInfo.imageChannels = ch;
+      modelInfo.imageDtype = parseDtype(dtype);
+      if (dims[2] > 0 && dims[3] > 0) {
+        modelInfo.imageFixedSize = { h: dims[2], w: dims[3] };
+      }
+    } else if (ch === 1 && !modelInfo.inputMaskName) {
+      modelInfo.inputMaskName = name;
+      modelInfo.maskDtype = parseDtype(dtype);
+      modelInfo.hasSeparateMask = true;
     }
   }
 
-  // Fallback por nombre
-  if (!foundImage) {
+  // 2) Fallback por nombre
+  if (!modelInfo.inputImageName) {
     for (var j = 0; j < inputs.length; j++) {
       var ln = inputs[j].toLowerCase();
       if (ln.indexOf('image') >= 0 || ln.indexOf('img') >= 0) {
-        foundImage = inputs[j];
-        var info2 = meta[inputs[j]];
-        imageDims = info2 ? info2.dimensions : null;
-        imageChannels = (imageDims && imageDims[1]) || 3;
+        var info2 = meta[inputs[j]] || {};
+        var dims2 = info2.dimensions ? info2.dimensions.slice() : null;
+        modelInfo.inputImageName = inputs[j];
+        modelInfo.imageDtype = parseDtype(info2.type || 'tensor(float)');
+        if (dims2 && dims2.length === 4) {
+          modelInfo.imageChannels = dims2[1] || 3;
+          if (dims2[2] > 0 && dims2[3] > 0) {
+            modelInfo.imageFixedSize = { h: dims2[2], w: dims2[3] };
+          }
+        }
         break;
       }
     }
   }
-  if (!foundMask) {
+  if (!modelInfo.inputMaskName) {
     for (var k = 0; k < inputs.length; k++) {
       var ln2 = inputs[k].toLowerCase();
-      if (ln2.indexOf('mask') >= 0) { foundMask = inputs[k]; break; }
+      if (ln2.indexOf('mask') >= 0) {
+        var info3 = meta[inputs[k]] || {};
+        modelInfo.inputMaskName = inputs[k];
+        modelInfo.maskDtype = parseDtype(info3.type || 'tensor(float)');
+        modelInfo.hasSeparateMask = true;
+        break;
+      }
     }
   }
 
-  modelInfo.inputImageName = foundImage;
-  modelInfo.inputMaskName = foundMask;
-  modelInfo.inputChannels = imageChannels;
-
-  // Detectar tamaño fijo
-  if (imageDims && imageDims[2] > 0 && imageDims[3] > 0) {
-    modelInfo.fixedSize = { h: imageDims[2], w: imageDims[3] };
-  }
-
-  // Determinar tipo
-  if (imageChannels === 4 && !foundMask) {
-    modelInfo.type = 'lama';
-  } else if (imageChannels === 3 && foundMask) {
+  // 3) Determinar tipo y semántica de la máscara
+  //    Regla: si ambos inputs son float32 → LaMa (máscara 1=eliminar)
+  //           si ambos inputs son uint8   → MIGAN (máscara 255=conservar)
+  if (modelInfo.imageDtype === 'uint8') {
     modelInfo.type = 'migan';
-    modelInfo.maskInverted = true;  // MIGAN: 255=conocido, 0=eliminar
-  } else if (imageChannels === 3 && !foundMask) {
-    // Modelo con imagen 3ch y sin máscara separada: asumimos LaMa con 3ch
-    modelInfo.type = 'lama';
+    modelInfo.maskMeaning = 'keep';
   } else {
     modelInfo.type = 'lama';
+    modelInfo.maskMeaning = 'eliminate';
   }
 
   console.log('[worker] Modelo detectado: ' + modelInfo.type);
-  console.log('  inputImage:', foundImage, 'channels=' + imageChannels, JSON.stringify(imageDims));
-  console.log('  inputMask:', foundMask);
-  console.log('  fixedSize:', JSON.stringify(modelInfo.fixedSize));
+  console.log('  inputImage:', modelInfo.inputImageName,
+              'ch=' + modelInfo.imageChannels,
+              'dtype=' + modelInfo.imageDtype,
+              'fixed=' + JSON.stringify(modelInfo.imageFixedSize));
+  console.log('  inputMask:', modelInfo.inputMaskName,
+              'dtype=' + modelInfo.maskDtype,
+              'hasSep=' + modelInfo.hasSeparateMask);
+  console.log('  maskMeaning:', modelInfo.maskMeaning);
+}
+
+function parseDtype(ortType) {
+  // ORT devuelve strings como 'tensor(float)', 'tensor(uint8)', 'tensor(float16)'
+  if (!ortType) return 'float32';
+  var t = ortType.toLowerCase();
+  if (t.indexOf('uint8') >= 0) return 'uint8';
+  if (t.indexOf('int8') >= 0) return 'int8';
+  if (t.indexOf('float16') >= 0) return 'float16';
+  if (t.indexOf('float') >= 0) return 'float32';
+  return 'float32';
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -287,91 +308,104 @@ function tensorToImageData(tensor, width, height) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Construcción de tensores para LaMa
-   - 4 canales: RGB (0..1) con máscara a negro + canal máscara (0/1)
-   - 3 canales: RGB (0..1) con máscara a negro
+   Construcción de tensores según dtype esperado
    ═══════════════════════════════════════════════════════════════ */
-function buildLamaInput(imgPx, maskPx, width, height) {
-  var size = width * height;
-  var channels = modelInfo.inputChannels;
 
-  if (channels === 4) {
-    var f4 = new Float32Array(4 * size);
+/** Convierte un Uint8ClampedArray RGBA (imagen) al dtype esperado. */
+function buildImageTensorFromRGBA(imgPx, maskPx, width, height) {
+  var size = width * height;
+  var dtype = modelInfo.imageDtype;
+  var channels = modelInfo.imageChannels;
+  var maskIsKeep = (modelInfo.maskMeaning === 'keep');
+
+  if (dtype === 'uint8') {
+    // ---- MIGAN: uint8 ----
+    // La imagen se envía tal cual (0..255).
+    // La máscara se envía con su semántica (255=conservar, 0=eliminar).
+    var imgData = new Uint8Array(channels * size);
+    var maskData = new Uint8Array(size);
+
     for (var i = 0; i < size; i++) {
       var i4 = i * 4;
-      var m = maskPx[i4] > 127 ? 1 : 0;
+      imgData[i]              = imgPx[i4];
+      imgData[size + i]       = imgPx[i4 + 1];
+      imgData[2 * size + i]   = imgPx[i4 + 2];
+      // Nuestra UI: 255 = eliminar. MIGAN: 0 = eliminar.
+      // Así que invertimos.
+      maskData[i] = maskPx[i4] > 127 ? 0 : 255;
+    }
+
+    return {
+      image: new ort.Tensor('uint8', imgData, [1, channels, height, width]),
+      mask: new ort.Tensor('uint8', maskData, [1, 1, height, width])
+    };
+  }
+
+  // ---- LaMa y similares: float32 ----
+  var f;
+  if (channels === 4) {
+    f = new Float32Array(4 * size);
+    for (var j = 0; j < size; j++) {
+      var j4 = j * 4;
+      var m = maskPx[j4] > 127 ? 1 : 0;
       if (m === 1) {
-        f4[i] = 0; f4[size + i] = 0; f4[2 * size + i] = 0;
+        f[j] = 0; f[size + j] = 0; f[2 * size + j] = 0;
       } else {
-        f4[i]            = imgPx[i4]     / 255;
-        f4[size + i]     = imgPx[i4 + 1] / 255;
-        f4[2 * size + i] = imgPx[i4 + 2] / 255;
+        f[j]            = imgPx[j4]     / 255;
+        f[size + j]     = imgPx[j4 + 1] / 255;
+        f[2 * size + j] = imgPx[j4 + 2] / 255;
       }
-      f4[3 * size + i] = m;
+      f[3 * size + j] = m;
     }
-    return new ort.Tensor('float32', f4, [1, 4, height, width]);
+    return {
+      image: new ort.Tensor('float32', f, [1, 4, height, width]),
+      mask: null
+    };
   }
 
-  var f3 = new Float32Array(3 * size);
-  for (var j = 0; j < size; j++) {
-    var j4 = j * 4;
-    var mm = maskPx[j4] > 127 ? 1 : 0;
-    if (mm === 1) {
-      f3[j] = 0; f3[size + j] = 0; f3[2 * size + j] = 0;
+  // channels === 3
+  f = new Float32Array(3 * size);
+  for (var q = 0; q < size; q++) {
+    var q4 = q * 4;
+    var mq = maskPx[q4] > 127 ? 1 : 0;
+    if (mq === 1) {
+      f[q] = 0; f[size + q] = 0; f[2 * size + q] = 0;
     } else {
-      f3[j]            = imgPx[j4]     / 255;
-      f3[size + j]     = imgPx[j4 + 1] / 255;
-      f3[2 * size + j] = imgPx[j4 + 2] / 255;
+      f[q]            = imgPx[q4]     / 255;
+      f[size + q]     = imgPx[q4 + 1] / 255;
+      f[2 * size + q] = imgPx[q4 + 2] / 255;
     }
   }
-  return new ort.Tensor('float32', f3, [1, 3, height, width]);
-}
 
-/* ═══════════════════════════════════════════════════════════════
-   Construcción de tensores para MIGAN
-   - image: uint8 RGB [1, 3, H, W], valores 0..255
-   - mask:  uint8 [1, 1, H, W], 255 = región conocida, 0 = eliminar
-   
-   IMPORTANTE: invertimos la máscara del usuario, porque en nuestra UI
-   el blanco (255) significa "eliminar", pero en MIGAN 0 = eliminar.
-   ═══════════════════════════════════════════════════════════════ */
-function buildMiganInput(imgPx, maskPx, width, height) {
-  var size = width * height;
-  var imgData = new Uint8Array(3 * size);
-  var maskData = new Uint8Array(size);
-
-  for (var i = 0; i < size; i++) {
-    var i4 = i * 4;
-    imgData[i]            = imgPx[i4];
-    imgData[size + i]     = imgPx[i4 + 1];
-    imgData[2 * size + i] = imgPx[i4 + 2];
-
-    // Invertir: blanco (255) del usuario → 0 en MIGAN (eliminar)
-    //          negro (0) del usuario → 255 en MIGAN (conservar)
-    maskData[i] = maskPx[i4] > 127 ? 0 : 255;
+  // Si el modelo espera máscara separada, también la construimos
+  var maskTensor = null;
+  if (modelInfo.hasSeparateMask) {
+    var mf = new Float32Array(size);
+    for (var r = 0; r < size; r++) {
+      mf[r] = maskPx[r * 4] > 127 ? 1 : 0;
+    }
+    maskTensor = new ort.Tensor('float32', mf, [1, 1, height, width]);
   }
 
   return {
-    image: new ort.Tensor('uint8', imgData, [1, 3, height, width]),
-    mask: new ort.Tensor('uint8', maskData, [1, 1, height, width])
+    image: new ort.Tensor('float32', f, [1, 3, height, width]),
+    mask: maskTensor
   };
 }
 
 /* ═══════════════════════════════════════════════════════════════
    Cálculo de geometría del crop
    ═══════════════════════════════════════════════════════════════ */
-function computeCropGeometry(bbox, imgW, imgH, targetSize) {
+function computeCropGeometry(bbox, imgW, imgH, fixedSize) {
   var cropW, cropH;
 
-  if (targetSize) {
-    // Modelo de tamaño fijo (LaMa 512×512)
+  if (fixedSize) {
     var side = Math.max(bbox.w, bbox.h) + PAD_USER * 2;
     if (side < 64) side = 64;
-    if (side > targetSize) side = targetSize;
+    if (side > fixedSize.w) side = fixedSize.w;
     cropW = side;
     cropH = side;
   } else {
-    // Modelo dinámico (MIGAN): crop = bbox + padding, alineado a 32
     cropW = alignTo32(bbox.w + PAD_USER * 2);
     cropH = alignTo32(bbox.h + PAD_USER * 2);
   }
@@ -390,8 +424,7 @@ function computeCropGeometry(bbox, imgW, imgH, targetSize) {
   var realW = Math.min(cropW, imgW - cropX);
   var realH = Math.min(cropH, imgH - cropY);
 
-  // Alinear al múltiplo de 32 si es dinámico
-  if (!targetSize) {
+  if (!fixedSize) {
     realW = alignTo32(realW);
     realH = alignTo32(realH);
     if (cropX + realW > imgW) realW = Math.max(32, imgW - cropX);
@@ -402,7 +435,7 @@ function computeCropGeometry(bbox, imgW, imgH, targetSize) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Extrae crop de la imagen completa (con reflejo si sale de bordes)
+   Extracción de crops
    ═══════════════════════════════════════════════════════════════ */
 function extractCrop(imageData, imgW, imgH, geom) {
   var cropImg = new Uint8ClampedArray(geom.w * geom.h * 4);
@@ -474,9 +507,7 @@ async function loadSession(modelArrayBuffer, modelId) {
   }
 
   var header = new Uint8Array(buf, 0, Math.min(16, buf.byteLength));
-  if (header[0] === 0x3C) {
-    throw new Error('El buffer es HTML, no un ONNX.');
-  }
+  if (header[0] === 0x3C) throw new Error('El buffer es HTML, no un ONNX.');
 
   var providers = [];
   if (useWebGPU && !forceWasm) providers.push('webgpu');
@@ -514,9 +545,7 @@ async function loadSession(modelArrayBuffer, modelId) {
 
   currentSession = session;
   currentModelId = modelId;
-
   detectModelType(session);
-  currentModelType = modelInfo.type;
 
   return {
     provider: usedProvider,
@@ -524,8 +553,10 @@ async function loadSession(modelArrayBuffer, modelId) {
     inputs: {
       image: modelInfo.inputImageName,
       mask: modelInfo.inputMaskName,
-      channels: modelInfo.inputChannels,
-      fixedSize: modelInfo.fixedSize,
+      channels: modelInfo.imageChannels,
+      imageDtype: modelInfo.imageDtype,
+      maskDtype: modelInfo.maskDtype,
+      fixedSize: modelInfo.imageFixedSize,
       names: session.inputNames.slice()
     }
   };
@@ -535,38 +566,29 @@ async function loadSession(modelArrayBuffer, modelId) {
    Inferencia sobre una región
    ═══════════════════════════════════════════════════════════════ */
 async function runOnRegion(imageData, maskFull, imgW, imgH, bbox) {
-  // 1) Calcular geometría del crop
-  var targetSize = modelInfo.fixedSize ? modelInfo.fixedSize.w : null;
-  var geom = computeCropGeometry(bbox, imgW, imgH, targetSize);
+  var fixedSize = modelInfo.imageFixedSize;
+  var geom = computeCropGeometry(bbox, imgW, imgH, fixedSize);
 
   console.log('[worker] Crop=' + geom.w + '×' + geom.h +
               ' en (' + geom.x + ',' + geom.y + ')' +
-              ' · tipo=' + modelInfo.type);
+              ' · tipo=' + modelInfo.type +
+              ' · dtype=' + modelInfo.imageDtype);
 
-  // 2) Extraer crop de imagen y máscara
   var cropImg = extractCrop(imageData, imgW, imgH, geom);
   var cropMask = extractMaskCrop(maskFull, imgW, imgH, geom);
 
-  // 3) Construir tensores según tipo de modelo
-  var feeds = {};
-  var cropW = geom.w;
-  var cropH = geom.h;
+  var tensors = buildImageTensorFromRGBA(cropImg, cropMask, geom.w, geom.h);
 
-  if (modelInfo.type === 'migan') {
-    var migan = buildMiganInput(cropImg, cropMask, cropW, cropH);
-    feeds[modelInfo.inputImageName] = migan.image;
-    feeds[modelInfo.inputMaskName] = migan.mask;
-  } else {
-    // LaMa
-    var lama = buildLamaInput(cropImg, cropMask, cropW, cropH);
-    feeds[modelInfo.inputImageName] = lama;
+  // Construir feeds
+  var feeds = {};
+  feeds[modelInfo.inputImageName] = tensors.image;
+  if (modelInfo.inputMaskName && tensors.mask) {
+    feeds[modelInfo.inputMaskName] = tensors.mask;
   }
 
-  // Liberar referencias grandes antes de inferir
   cropImg = null;
   cropMask = null;
 
-  // 4) Inferencia
   var t0 = Date.now();
   var results = await currentSession.run(feeds);
   var dt = ((Date.now() - t0) / 1000).toFixed(2);
@@ -574,23 +596,20 @@ async function runOnRegion(imageData, maskFull, imgW, imgH, bbox) {
 
   feeds = null;
 
-  // 5) Convertir salida
+  // Convertir salida
   var outKey = currentSession.outputNames[0] || Object.keys(results)[0];
   var outTensor = results[outKey];
   var outDims = outTensor.dims;
   var outH = outDims[outDims.length - 2];
   var outW = outDims[outDims.length - 1];
 
-  // MIGAN devuelve la imagen ya "pasted" a las dimensiones del input.
-  // LaMa también. Así que extraemos el resultado tal cual.
   var resultImg = tensorToImageData(outTensor, outW, outH);
 
-  // 6) Ajustar tamaño: si la salida es mayor que el crop, recortar
-  var finalW = Math.min(outW, cropW);
-  var finalH = Math.min(outH, cropH);
+  // Recortar si la salida es mayor que el crop
+  var finalW = Math.min(outW, geom.w);
+  var finalH = Math.min(outH, geom.h);
 
   if (finalW !== outW || finalH !== outH) {
-    // Recortar desde la esquina superior izquierda (para modelos que devuelven padding)
     var cropped = new Uint8ClampedArray(finalW * finalH * 4);
     for (var j = 0; j < finalH; j++) {
       for (var i = 0; i < finalW; i++) {
@@ -615,7 +634,7 @@ async function runOnRegion(imageData, maskFull, imgW, imgH, bbox) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Pegar resultado en la imagen completa
+   Pegar resultado
    ═══════════════════════════════════════════════════════════════ */
 function pasteResult(fullImgData, resultData, imgW, imgH, pasteX, pasteY, pasteW, pasteH) {
   var destW = Math.min(pasteW, imgW - pasteX);
@@ -635,7 +654,7 @@ function pasteResult(fullImgData, resultData, imgW, imgH, pasteX, pasteY, pasteW
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Estrategia de ejecución
+   Estrategia
    ═══════════════════════════════════════════════════════════════ */
 async function runInference(imageData, maskData, width, height) {
   if (!currentSession) throw new Error('Modelo no cargado');
@@ -660,9 +679,7 @@ async function runInference(imageData, maskData, width, height) {
     processWhole = true;
   }
 
-  console.log('[worker] Estrategia=' + strategy +
-              ' | regiones=' + regions.length +
-              ' | tipo=' + modelInfo.type);
+  console.log('[worker] Estrategia=' + strategy + ' | regiones=' + regions.length);
 
   self.postMessage({
     type: 'progress',
@@ -743,10 +760,6 @@ self.onmessage = async function (e) {
   } catch (err) {
     var errMsg = serializeError(err);
     console.error('[worker] Error capturado:', errMsg);
-    self.postMessage({
-      id: id,
-      type: 'error',
-      error: errMsg
-    });
+    self.postMessage({ id: id, type: 'error', error: errMsg });
   }
 };
