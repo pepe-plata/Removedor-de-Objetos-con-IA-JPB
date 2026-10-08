@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════════════════
    app.js — Removedor de Objetos con IA JPB
-   Modelos: LAMA FP16 / LAMA INT8 (seleccionables por el usuario)
+   Modelos: LAMA FP16 / LAMA INT8 desde Carve/LaMa-ONNX
    Gestos: 2 dedos = pan O zoom (excluyentes)
    ═══════════════════════════════════════════════════════════════ */
 
@@ -59,12 +59,7 @@ var state = {
 };
 
 /* ═══════════════════════════════════════════════════════════════
-   Modelos disponibles
-   
-   - lama_fp16.onnx : ~107 MB · mejor calidad · WebGPU en PC
-   - lama_int8.onnx : ~62 MB  · buena calidad · más rápido en CPU/WASM
-   
-   El usuario puede elegir cualquiera desde el selector.
+   Modelos disponibles — Repo Carve/LaMa-ONNX (URLs verificadas)
    ═══════════════════════════════════════════════════════════════ */
 var MODELS = [
   {
@@ -72,9 +67,10 @@ var MODELS = [
     name: 'LAMA FP16 (Alta calidad)',
     description: 'Mejor calidad, ideal para WebGPU en PC',
     size: '~107 MB',
+    minBytes: 90 * 1024 * 1024,
     urls: [
-      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp16.onnx',
-      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx'
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx',
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx'
     ]
   },
   {
@@ -82,9 +78,10 @@ var MODELS = [
     name: 'LAMA INT8 (Rápido en móvil)',
     description: 'Menor tamaño y más rápido en CPU/WASM',
     size: '~62 MB',
+    minBytes: 50 * 1024 * 1024,
     urls: [
-      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_int8.onnx',
-      'https://huggingface.co/g-ronimo/lama/resolve/main/lama.onnx'
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_int8.onnx',
+      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx'
     ]
   }
 ];
@@ -95,30 +92,50 @@ function getModelById(id) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Validación de buffer ONNX
+   Validación de buffer ONNX (magic bytes + tamaño mínimo)
    ═══════════════════════════════════════════════════════════════ */
-function isValidOnnxBuffer(buffer) {
+function isValidOnnxBuffer(buffer, modelId) {
   if (!buffer) return { ok: false, reason: 'buffer es null/undefined' };
   if (!(buffer instanceof ArrayBuffer)) return { ok: false, reason: 'no es ArrayBuffer (tipo: ' + typeof buffer + ')' };
   if (buffer.byteLength < 1024) return { ok: false, reason: 'demasiado pequeño (' + buffer.byteLength + ' bytes)' };
 
+  if (modelId) {
+    var model = getModelById(modelId);
+    if (model && model.minBytes && buffer.byteLength < model.minBytes) {
+      return {
+        ok: false,
+        reason: 'tamaño insuficiente: ' + formatBytes(buffer.byteLength) +
+                ' (esperado mínimo ' + formatBytes(model.minBytes) + ')',
+        truncated: true
+      };
+    }
+  }
+
   var header = new Uint8Array(buffer, 0, Math.min(16, buffer.byteLength));
   var headerStr = String.fromCharCode.apply(null, header);
+  var headerHex = Array.from(header).map(function (b) {
+    return ('0' + b.toString(16)).slice(-2);
+  }).join(' ');
 
   if (header[0] === 0x3C) {
-    return { ok: false, reason: 'empieza con "<" → es HTML, no ONNX', header: headerStr };
+    return { ok: false, reason: 'empieza con "<" → es HTML, no ONNX', header: headerHex };
   }
   if (headerStr.indexOf('<!') === 0 || headerStr.indexOf('<html') >= 0 || headerStr.indexOf('<?xml') >= 0) {
-    return { ok: false, reason: 'es una página HTML/XML, no un modelo', header: headerStr };
+    return { ok: false, reason: 'es una página HTML/XML, no un modelo', header: headerHex };
   }
   if (headerStr.indexOf('Not Found') >= 0 || headerStr.indexOf('error') >= 0) {
-    return { ok: false, reason: 'contiene mensaje de error en texto', header: headerStr };
+    return { ok: false, reason: 'contiene mensaje de error en texto', header: headerHex };
   }
 
-  return {
-    ok: true,
-    header: Array.from(header).map(function (b) { return ('0' + b.toString(16)).slice(-2); }).join(' ')
-  };
+  if (header[0] !== 0x08) {
+    return {
+      ok: false,
+      reason: 'header inesperado (no empieza con 0x08): ' + headerHex,
+      header: headerHex
+    };
+  }
+
+  return { ok: true, header: headerHex };
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -133,7 +150,6 @@ function init() {
   createInternalCanvases(1, 1);
   syncThemeSwitch();
 
-  // Rellenar el selector de modelos con TODOS los modelos disponibles
   var modelSelect = $('#modelSelect');
   if (modelSelect) {
     modelSelect.innerHTML = '';
@@ -143,7 +159,6 @@ function init() {
       opt.textContent = MODELS[i].name;
       modelSelect.appendChild(opt);
     }
-    // Modelo por defecto según plataforma (pero el usuario puede cambiar)
     modelSelect.value = IS_ANDROID ? 'lama-int8' : 'lama-fp16';
   }
 
@@ -401,7 +416,8 @@ function bindUI() {
     modelSelect2.addEventListener('change', function () {
       state.modelLoaded = false;
       state.modelLoadedId = null;
-      setStatus('Modelo cambiado a: ' + (getModelById(modelSelect2.value) || {}).name);
+      var m = getModelById(modelSelect2.value);
+      setStatus('Modelo cambiado a: ' + (m ? m.name : modelSelect2.value));
     });
   }
 
@@ -423,21 +439,15 @@ function bindCanvasEvents() {
   var pendingDrawTimer = null;
   var spaceDown = false;
 
-  // Estado para gestos de 2 dedos
   var gesture = {
     active: false,
-    mode: null,          // 'pinch' | 'pan' | null
+    mode: null,
     startDist: 0,
     startZoom: 1,
     startMidX: 0,
     startMidY: 0,
     startOffsetX: 0,
-    startOffsetY: 0,
-    // Referencia inicial de cada dedo
-    p1StartX: 0,
-    p1StartY: 0,
-    p2StartX: 0,
-    p2StartY: 0
+    startOffsetY: 0
   };
 
   canvasWrap.addEventListener('pointerdown', onPointerDown);
@@ -470,7 +480,6 @@ function bindCanvasEvents() {
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (pointers.size === 2) {
-      // Cancelar cualquier dibujo pendiente
       if (pendingDrawTimer) { clearTimeout(pendingDrawTimer); pendingDrawTimer = null; }
       cancelDrawing();
       startGesture();
@@ -548,7 +557,6 @@ function bindCanvasEvents() {
     zoomAt(e.clientX, e.clientY, newZoom);
   }
 
-  /* ─── Gestos de 2 dedos ─── */
   function startGesture() {
     var pts = Array.from(pointers.values());
     if (pts.length < 2) return;
@@ -558,17 +566,13 @@ function bindCanvasEvents() {
     var dist = Math.hypot(dx, dy);
 
     gesture.active = true;
-    gesture.mode = null;   // se decide en el primer move
+    gesture.mode = null;
     gesture.startDist = dist;
     gesture.startZoom = state.zoom;
     gesture.startMidX = (pts[0].x + pts[1].x) / 2;
     gesture.startMidY = (pts[0].y + pts[1].y) / 2;
     gesture.startOffsetX = state.offsetX;
     gesture.startOffsetY = state.offsetY;
-    gesture.p1StartX = pts[0].x;
-    gesture.p1StartY = pts[0].y;
-    gesture.p2StartX = pts[1].x;
-    gesture.p2StartY = pts[1].y;
   }
 
   function updateGesture() {
@@ -583,25 +587,18 @@ function bindCanvasEvents() {
     var midX = (pts[0].x + pts[1].x) / 2;
     var midY = (pts[0].y + pts[1].y) / 2;
 
-    // Desplazamiento del centro (indica pan)
     var midDx = midX - gesture.startMidX;
     var midDy = midY - gesture.startMidY;
     var midMove = Math.hypot(midDx, midDy);
 
-    // Cambio de distancia (indica zoom)
     var distDelta = Math.abs(dist - gesture.startDist);
     var distRatio = dist / gesture.startDist;
 
-    // ─── DECISIÓN DE MODO (solo la primera vez) ───
     if (gesture.mode === null) {
-      // Umbrales para decidir intención
-      var ZOOM_THRESHOLD = 8;    // px de cambio en la distancia entre dedos
-      var PAN_THRESHOLD = 8;     // px de movimiento del centro
+      var ZOOM_THRESHOLD = 8;
+      var PAN_THRESHOLD = 8;
 
-      // ¿El usuario está claramente haciendo zoom?
       var isZoomIntent = distDelta > ZOOM_THRESHOLD && distDelta > midMove * 0.8;
-
-      // ¿El usuario está claramente haciendo pan?
       var isPanIntent = midMove > PAN_THRESHOLD && distDelta < ZOOM_THRESHOLD * 0.6;
 
       if (isZoomIntent) {
@@ -609,15 +606,12 @@ function bindCanvasEvents() {
       } else if (isPanIntent) {
         gesture.mode = 'pan';
       }
-      // Si no se decide aún, no hacemos nada (esperamos más movimiento)
     }
 
-    // ─── EJECUTAR SOLO EL MODO ACTIVO (nunca ambos) ───
     if (gesture.mode === 'pinch') {
       var newZoom = Math.max(0.05, Math.min(20, gesture.startZoom * distRatio));
 
       var rect = canvasWrap.getBoundingClientRect();
-      // Zoom centrado en la posición inicial del centro (más estable)
       var cx = gesture.startMidX - rect.left;
       var cy = gesture.startMidY - rect.top;
 
@@ -627,15 +621,12 @@ function bindCanvasEvents() {
       state.zoom = newZoom;
       updateTransform();
     } else if (gesture.mode === 'pan') {
-      // Pan: mover usando el desplazamiento del centro de los dedos
       state.offsetX = gesture.startOffsetX + midDx;
       state.offsetY = gesture.startOffsetY + midDy;
       updateTransform();
     }
-    // Si mode es null: no hacer nada (esperar a que se decida)
   }
 
-  /* ─── Dibujo ─── */
   function startDrawing(e) {
     if (!state.imgWidth) return;
     if (!state.history.length) saveMaskSnapshot();
@@ -1187,7 +1178,7 @@ async function runAI() {
 
     if (hasIt) {
       var checkBuf = await window.JPBDB.getModel(modelId);
-      var validation = isValidOnnxBuffer(checkBuf);
+      var validation = isValidOnnxBuffer(checkBuf, modelId);
       if (!validation.ok) {
         console.warn('[JPB] Modelo cacheado inválido: ' + validation.reason);
         await window.JPBDB.deleteModel(modelId);
@@ -1203,10 +1194,13 @@ async function runAI() {
       setStatus('Descargando modelo IA...');
       var buffer = await downloadModelWithFallback(modelId);
 
-      var dlValidation = isValidOnnxBuffer(buffer);
+      var dlValidation = isValidOnnxBuffer(buffer, modelId);
       if (!dlValidation.ok) {
         throw new Error('El modelo descargado no es válido: ' + dlValidation.reason);
       }
+
+      console.log('[JPB] Modelo descargado OK: ' + buffer.byteLength + ' bytes');
+      console.log('[JPB] Header descargado: ' + dlValidation.header);
 
       await window.JPBDB.saveModel(modelId, buffer, {
         name: getModelById(modelId).name,
@@ -1224,25 +1218,41 @@ async function runAI() {
       var modelBuf = await window.JPBDB.getModel(modelId);
       if (!modelBuf) throw new Error('No se pudo leer el modelo de IndexedDB');
 
-      var preValidation = isValidOnnxBuffer(modelBuf);
+      var preValidation = isValidOnnxBuffer(modelBuf, modelId);
       if (!preValidation.ok) {
+        console.warn('[JPB] Modelo inválido en IndexedDB:', preValidation.reason);
         await window.JPBDB.deleteModel(modelId);
-        throw new Error('El modelo en IndexedDB está corrupto. Intenta de nuevo.');
+        throw new Error('El modelo está corrupto (' + preValidation.reason +
+                        '). Vuelve a pulsar "Remover" para re-descargarlo.');
       }
+
+      console.log('[JPB] Modelo validado: ' + modelBuf.byteLength +
+                  ' bytes, header=' + preValidation.header);
 
       var bufCopy = modelBuf.slice(0);
 
-      var loadRes = await workerCall('load', {
-        buffer: bufCopy,
-        modelId: modelId
-      });
+      try {
+        var loadRes = await workerCall('load', {
+          buffer: bufCopy,
+          modelId: modelId
+        });
 
-      state.modelLoaded = true;
-      state.modelLoadedId = modelId;
-      state.modelProvider = loadRes.provider || 'wasm';
-      state.modelInputSize = loadRes.inputSize || null;
+        state.modelLoaded = true;
+        state.modelLoadedId = modelId;
+        state.modelProvider = loadRes.provider || 'wasm';
+        state.modelInputSize = loadRes.inputSize || null;
 
-      setStatus('Modelo listo (' + state.modelProvider + ')');
+        console.log('[JPB] Modelo cargado con provider: ' + state.modelProvider);
+        setStatus('Modelo listo (' + state.modelProvider + ')');
+      } catch (loadErr) {
+        console.error('[JPB] Falló load en worker:', loadErr.message);
+        console.warn('[JPB] Eliminando modelo corrupto de IndexedDB...');
+        try { await window.JPBDB.deleteModel(modelId); } catch (e) {}
+        state.modelLoaded = false;
+        state.modelLoadedId = null;
+        throw new Error('El modelo cacheado está corrupto y fue eliminado. ' +
+                        'Vuelve a pulsar "Remover" para descargarlo de nuevo.');
+      }
     }
 
     setStatus('Procesando con IA...');
@@ -1274,7 +1284,6 @@ async function runAI() {
     if (res && res.imageData) {
       state.currentCtx.putImageData(res.imageData, 0, 0);
 
-      // Limpiar la máscara tras remover
       state.maskCtx.clearRect(0, 0, state.imgWidth, state.imgHeight);
       state.history = [];
       state.historyIndex = -1;
@@ -1342,10 +1351,13 @@ async function downloadWithProgress(url, modelName) {
   var contentType = (resp.headers.get('content-type') || '').toLowerCase();
   if (contentType.indexOf('text/html') >= 0) {
     closeModal(progressModal);
-    throw new Error('La URL devolvió HTML, no un ONNX.');
+    throw new Error('La URL devolvió HTML, no un ONNX. Verifica la URL del modelo.');
   }
 
   var total = +(resp.headers.get('content-length') || 0);
+  console.log('[JPB] HTTP ' + resp.status + ' | Content-Type: ' + contentType +
+              ' | Content-Length: ' + (total ? formatBytes(total) : 'desconocido'));
+
   var reader = resp.body.getReader();
   var chunks = [];
   var received = 0;
@@ -1363,6 +1375,15 @@ async function downloadWithProgress(url, modelName) {
     } else {
       if (progressInfo) progressInfo.textContent = formatBytes(received);
     }
+  }
+
+  console.log('[JPB] Descarga finalizada: ' + formatBytes(received) +
+              (total ? ' de ' + formatBytes(total) : ''));
+
+  if (total > 0 && received < total) {
+    closeModal(progressModal);
+    throw new Error('Descarga incompleta: ' + formatBytes(received) +
+                    ' de ' + formatBytes(total));
   }
 
   var buffer = new Uint8Array(received);
@@ -1656,7 +1677,7 @@ async function openModelsModal() {
         badge.textContent = 'Descargando';
         try {
           var buffer = await downloadModelWithFallback(model.id);
-          var v = isValidOnnxBuffer(buffer);
+          var v = isValidOnnxBuffer(buffer, model.id);
           if (!v.ok) throw new Error('Modelo inválido: ' + v.reason);
           await window.JPBDB.saveModel(model.id, buffer, { name: model.name, url: model.urls[0] });
           setStatus('Modelo descargado');
