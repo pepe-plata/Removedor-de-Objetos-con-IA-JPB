@@ -4,14 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
 <meta name="theme-color" content="#4f46e5">
-<meta name="description" content="Removedor de Objetos con IA JPB - Remueve objetos de imágenes con IA local">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Removedor de Objetos con IA JPB</title>
 <link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
-<link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="stylesheet" href="styles.css">
 
 <script>
@@ -34,7 +29,6 @@
 </head>
 <body>
 
-<!-- Splash -->
 <div id="splash" class="splash">
   <div class="splash-content">
     <img src="icons/icon-512.png" alt="JPB" class="splash-icon">
@@ -43,7 +37,6 @@
   </div>
 </div>
 
-<!-- Header -->
 <header id="appHeader" class="app-header">
   <div class="header-left">
     <button id="menuBtn" class="icon-btn" title="Menú" aria-label="Menú" type="button">
@@ -69,7 +62,6 @@
   </div>
 </header>
 
-<!-- Layout -->
 <div id="layout" class="layout">
 
   <aside id="sidebar" class="sidebar">
@@ -84,9 +76,8 @@
         <div class="sec-body">
           <label class="field-label">Modelo</label>
           <select id="modelSelect" class="select">
-			  <option value="lama-fp16">LAMA FP16 (Dinámico · Recomendado)</option>
-			  <option value="lama-fp32">LAMA FP32 (Dinámico · Alta precisión)</option>
-			</select>
+            <!-- Se rellena dinámicamente desde app.js según plataforma -->
+          </select>
 
           <button id="manageModelsBtn" class="btn btn-ghost btn-block" type="button">
             <img src="icons/info.png" alt="" class="ico">
@@ -196,7 +187,6 @@
   <span id="ftStatus" class="ft-status">Listo</span>
 </footer>
 
-<!-- Modal Guardar -->
 <div id="saveModal" class="modal" hidden>
   <div class="modal-card">
     <div class="modal-head">
@@ -229,7 +219,6 @@
   </div>
 </div>
 
-<!-- Modal Modelos -->
 <div id="modelsModal" class="modal" hidden>
   <div class="modal-card modal-large">
     <div class="modal-head">
@@ -247,7 +236,6 @@
   </div>
 </div>
 
-<!-- Modal Progreso -->
 <div id="progressModal" class="modal" hidden>
   <div class="modal-card modal-small">
     <div class="modal-head">
@@ -257,13 +245,15 @@
       <div class="progress-bar">
         <div id="progressFill" class="progress-fill"></div>
       </div>
-      <div id="progressText" class="progress-text">0%</div>
+      <div id="progressStats" class="progress-stats">
+        <span class="prog-left">0%</span>
+        <span class="prog-right">0 MB / 0 MB</span>
+      </div>
       <div id="progressInfo" class="progress-info"></div>
     </div>
   </div>
 </div>
 
-<!-- Modal Ayuda -->
 <div id="helpModal" class="modal" hidden>
   <div class="modal-card modal-large">
     <div class="modal-head">
@@ -290,9 +280,8 @@
         <h4>Uso en Android</h4>
         <ul>
           <li>Un dedo: <b>pan</b> o <b>dibujar</b>.</li>
-          <li>Dos dedos en paralelo (scroll): <b>pan</b>.</li>
-          <li>Dos dedos separándose/juntándose: <b>zoom</b>.</li>
-          <li>Backend IA: <b>WASM/CPU</b>. Recomendado modelo INT8.</li>
+          <li>Dos dedos: <b>pinch zoom + pan</b> simultáneos.</li>
+          <li>Modelo IA: <b>MIGAN</b> (28 MB, optimizado para móvil).</li>
         </ul>
       </div>
       <div id="tabWindows" class="tab-panel">
@@ -300,7 +289,7 @@
         <ul>
           <li>Rueda: <b>zoom</b>. Shift+rueda: horizontal. Alt+rueda: vertical.</li>
           <li>Espacio + arrastrar: <b>pan</b>.</li>
-          <li>Backend IA: <b>WebGPU</b>. Recomendado modelo FP16.</li>
+          <li>Modelo IA: <b>LAMA FP32</b> con WebGPU.</li>
         </ul>
       </div>
       <div id="tabKeys" class="tab-panel">
@@ -317,7 +306,7 @@
         <ul>
           <li>Procesamiento <b>local</b>, sin subir imágenes.</li>
           <li>Modelos cacheados en <b>IndexedDB</b>.</li>
-          <li>Puedes cambiar entre <b>FP16</b> e <b>INT8</b> desde el sidebar.</li>
+          <li>Android: MIGAN · Windows: LAMA FP32.</li>
         </ul>
       </div>
     </div>

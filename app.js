@@ -1,11 +1,11 @@
 /* ═══════════════════════════════════════════════════════════════
    app.js — Removedor de Objetos con IA JPB
    
-   Modelos dinámicos (acepta H×W múltiplos de 32):
-     - lama_fp16.onnx (recomendado)
-     - lama_fp32.onnx (alta precisión)
+   Plataformas:
+     - Android → MIGAN (28 MB, móvil-friendly, dimensiones dinámicas)
+     - Windows → LAMA FP32 (alta precisión, WebGPU)
    
-   Gestos: 2 dedos = pan O zoom (excluyentes)
+   Gestos: 2 dedos hacen pinch zoom + pan simultáneos
    ═══════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -56,7 +56,7 @@ var state = {
   modelLoaded: false,
   modelLoadedId: null,
   modelProvider: null,
-  modelInputSize: null,
+  modelType: null,
   processing: false,
 
   wakeLock: null
@@ -65,29 +65,26 @@ var state = {
 /* ═══════════════════════════════════════════════════════════════
    Modelos disponibles
    
-   Usamos los exports DINÁMICOS de LaMa (acepta H×W múltiplos de 32).
-   URLs verificadas del repo g-ronimo/lama con fallback a Carve.
+   - En Android usamos MIGAN (28 MB, dinámico, móvil-friendly)
+   - En Windows usamos LAMA FP32 (210 MB, precisión máxima)
    
-   Ventaja del modelo dinámico: procesa SOLO el área pintada
-   (redondeada a múltiplo de 32), lo que reduce drásticamente la
-   memoria usada en Android → evita errores OOM.
+   La lista se filtra según la plataforma detectada.
    ═══════════════════════════════════════════════════════════════ */
-var MODELS = [
-  {
-    id: 'lama-fp16',
-    name: 'LAMA FP16 (Recomendado)',
-    description: 'Modelo dinámico · procesa solo el área pintada',
-    size: '~110 MB',
-    minBytes: 90 * 1024 * 1024,
+var ALL_MODELS = {
+  'migan': {
+    id: 'migan',
+    name: 'MIGAN (Rápido · Android)',
+    description: 'Modelo ligero optimizado para móvil · dimensiones dinámicas',
+    size: '~28 MB',
+    minBytes: 20 * 1024 * 1024,
     urls: [
-      'https://huggingface.co/g-ronimo/lama/resolve/main/lama_fp16.onnx',
-      'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp16.onnx'
+      'https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx'
     ]
   },
-  {
+  'lama-fp32': {
     id: 'lama-fp32',
-    name: 'LAMA FP32 (Alta precisión)',
-    description: 'Modelo dinámico · más lento pero más preciso',
+    name: 'LAMA FP32 (Alta precisión · Windows)',
+    description: 'Modelo completo · mejor calidad',
     size: '~210 MB',
     minBytes: 180 * 1024 * 1024,
     urls: [
@@ -95,7 +92,15 @@ var MODELS = [
       'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx'
     ]
   }
-];
+};
+
+// Filtro por plataforma
+var MODELS;
+if (IS_ANDROID) {
+  MODELS = [ALL_MODELS['migan'], ALL_MODELS['lama-fp32']]; // MIGAN por defecto
+} else {
+  MODELS = [ALL_MODELS['lama-fp32'], ALL_MODELS['migan']]; // LAMA por defecto
+}
 
 function getModelById(id) {
   for (var i = 0; i < MODELS.length; i++) if (MODELS[i].id === id) return MODELS[i];
@@ -103,15 +108,7 @@ function getModelById(id) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Alinea un valor al múltiplo de 32 más cercano hacia arriba.
-   Necesario porque LaMa dinámico requiere H y W múltiplos de 32.
-   ═══════════════════════════════════════════════════════════════ */
-function alignTo32(value) {
-  return Math.max(32, Math.ceil(value / 32) * 32);
-}
-
-/* ═══════════════════════════════════════════════════════════════
-   Validación de buffer ONNX (magic bytes + tamaño mínimo)
+   Validación de buffer ONNX
    ═══════════════════════════════════════════════════════════════ */
 function isValidOnnxBuffer(buffer, modelId) {
   if (!buffer) return { ok: false, reason: 'buffer es null/undefined' };
@@ -179,7 +176,8 @@ function init() {
       opt.textContent = MODELS[i].name;
       modelSelect.appendChild(opt);
     }
-    modelSelect.value = 'lama-fp16';
+    // Seleccionar el primero (que es el preferido para la plataforma)
+    modelSelect.value = MODELS[0].id;
   }
 
   if (!window.JPBDB || !window.JPBDB.isAvailable || !window.JPBDB.isAvailable()) {
@@ -209,7 +207,7 @@ function init() {
   }
 
   updateUIState();
-  setStatus('Listo');
+  setStatus('Listo (' + (IS_ANDROID ? 'MIGAN' : 'LAMA FP32') + ')');
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -436,6 +434,7 @@ function bindUI() {
     modelSelect2.addEventListener('change', function () {
       state.modelLoaded = false;
       state.modelLoadedId = null;
+      state.modelType = null;
       var m = getModelById(modelSelect2.value);
       setStatus('Modelo cambiado a: ' + (m ? m.name : modelSelect2.value));
     });
@@ -448,6 +447,9 @@ function bindUI() {
 
 /* ═══════════════════════════════════════════════════════════════
    Canvas eventos (dibujo, pan, zoom, gestos táctiles)
+   
+   ⭐ NUEVO: gestos táctiles SIN exclusividad
+   - Pinch zoom y pan ocurren simultáneamente
    ═══════════════════════════════════════════════════════════════ */
 function bindCanvasEvents() {
   var canvasWrap = $('#canvasWrap');
@@ -459,9 +461,9 @@ function bindCanvasEvents() {
   var pendingDrawTimer = null;
   var spaceDown = false;
 
+  // Estado para gestos de 2 dedos (pinch + pan simultáneos)
   var gesture = {
     active: false,
-    mode: null,
     startDist: 0,
     startZoom: 1,
     startMidX: 0,
@@ -553,7 +555,6 @@ function bindCanvasEvents() {
     pointers.delete(e.pointerId);
     if (pointers.size < 2) {
       gesture.active = false;
-      gesture.mode = null;
     }
 
     if (pendingDrawTimer) { clearTimeout(pendingDrawTimer); pendingDrawTimer = null; }
@@ -577,6 +578,7 @@ function bindCanvasEvents() {
     zoomAt(e.clientX, e.clientY, newZoom);
   }
 
+  /* ─── Gestos de 2 dedos: pinch + pan SIMULTÁNEOS ─── */
   function startGesture() {
     var pts = Array.from(pointers.values());
     if (pts.length < 2) return;
@@ -586,7 +588,6 @@ function bindCanvasEvents() {
     var dist = Math.hypot(dx, dy);
 
     gesture.active = true;
-    gesture.mode = null;
     gesture.startDist = dist;
     gesture.startZoom = state.zoom;
     gesture.startMidX = (pts[0].x + pts[1].x) / 2;
@@ -607,46 +608,29 @@ function bindCanvasEvents() {
     var midX = (pts[0].x + pts[1].x) / 2;
     var midY = (pts[0].y + pts[1].y) / 2;
 
+    // Zoom: basado en el cambio de distancia entre dedos
+    var distRatio = dist / gesture.startDist;
+    var newZoom = Math.max(0.05, Math.min(20, gesture.startZoom * distRatio));
+
+    // Pan: basado en el desplazamiento del punto medio
     var midDx = midX - gesture.startMidX;
     var midDy = midY - gesture.startMidY;
-    var midMove = Math.hypot(midDx, midDy);
 
-    var distDelta = Math.abs(dist - gesture.startDist);
-    var distRatio = dist / gesture.startDist;
+    // Aplicar ambos: zoom centrado en el punto medio inicial + pan acumulado
+    var canvasWrap = $('#canvasWrap');
+    var rect = canvasWrap.getBoundingClientRect();
+    var cx = gesture.startMidX - rect.left;
+    var cy = gesture.startMidY - rect.top;
 
-    if (gesture.mode === null) {
-      var ZOOM_THRESHOLD = 8;
-      var PAN_THRESHOLD = 8;
-
-      var isZoomIntent = distDelta > ZOOM_THRESHOLD && distDelta > midMove * 0.8;
-      var isPanIntent = midMove > PAN_THRESHOLD && distDelta < ZOOM_THRESHOLD * 0.6;
-
-      if (isZoomIntent) {
-        gesture.mode = 'pinch';
-      } else if (isPanIntent) {
-        gesture.mode = 'pan';
-      }
-    }
-
-    if (gesture.mode === 'pinch') {
-      var newZoom = Math.max(0.05, Math.min(20, gesture.startZoom * distRatio));
-
-      var rect = canvasWrap.getBoundingClientRect();
-      var cx = gesture.startMidX - rect.left;
-      var cy = gesture.startMidY - rect.top;
-
-      var k = newZoom / gesture.startZoom;
-      state.offsetX = cx - (cx - gesture.startOffsetX) * k;
-      state.offsetY = cy - (cy - gesture.startOffsetY) * k;
-      state.zoom = newZoom;
-      updateTransform();
-    } else if (gesture.mode === 'pan') {
-      state.offsetX = gesture.startOffsetX + midDx;
-      state.offsetY = gesture.startOffsetY + midDy;
-      updateTransform();
-    }
+    var k = newZoom / gesture.startZoom;
+    // Zoom centrado en el punto medio + traslación del midPoint
+    state.offsetX = cx - (cx - gesture.startOffsetX) * k + midDx;
+    state.offsetY = cy - (cy - gesture.startOffsetY) * k + midDy;
+    state.zoom = newZoom;
+    updateTransform();
   }
 
+  /* ─── Dibujo ─── */
   function startDrawing(e) {
     if (!state.imgWidth) return;
     if (!state.history.length) saveMaskSnapshot();
@@ -1205,8 +1189,6 @@ async function runAI() {
         hasIt = false;
         state.modelLoaded = false;
         state.modelLoadedId = null;
-      } else {
-        console.log('[JPB] Modelo cacheado válido: ' + checkBuf.byteLength + ' bytes');
       }
     }
 
@@ -1218,9 +1200,6 @@ async function runAI() {
       if (!dlValidation.ok) {
         throw new Error('El modelo descargado no es válido: ' + dlValidation.reason);
       }
-
-      console.log('[JPB] Modelo descargado OK: ' + buffer.byteLength + ' bytes');
-      console.log('[JPB] Header descargado: ' + dlValidation.header);
 
       await window.JPBDB.saveModel(modelId, buffer, {
         name: getModelById(modelId).name,
@@ -1240,14 +1219,9 @@ async function runAI() {
 
       var preValidation = isValidOnnxBuffer(modelBuf, modelId);
       if (!preValidation.ok) {
-        console.warn('[JPB] Modelo inválido en IndexedDB:', preValidation.reason);
         await window.JPBDB.deleteModel(modelId);
-        throw new Error('El modelo está corrupto (' + preValidation.reason +
-                        '). Vuelve a pulsar "Remover" para re-descargarlo.');
+        throw new Error('El modelo está corrupto. Vuelve a pulsar "Remover".');
       }
-
-      console.log('[JPB] Modelo validado: ' + modelBuf.byteLength +
-                  ' bytes, header=' + preValidation.header);
 
       var bufCopy = modelBuf.slice(0);
 
@@ -1260,18 +1234,17 @@ async function runAI() {
         state.modelLoaded = true;
         state.modelLoadedId = modelId;
         state.modelProvider = loadRes.provider || 'wasm';
-        state.modelInputSize = loadRes.inputSize || null;
+        state.modelType = loadRes.modelType || 'unknown';
 
-        console.log('[JPB] Modelo cargado con provider: ' + state.modelProvider);
-        setStatus('Modelo listo (' + state.modelProvider + ')');
+        console.log('[JPB] Modelo cargado: tipo=' + state.modelType +
+                    ' provider=' + state.modelProvider);
+        setStatus('Modelo listo (' + state.modelType + ' · ' + state.modelProvider + ')');
       } catch (loadErr) {
         console.error('[JPB] Falló load en worker:', loadErr.message);
-        console.warn('[JPB] Eliminando modelo corrupto de IndexedDB...');
         try { await window.JPBDB.deleteModel(modelId); } catch (e) {}
         state.modelLoaded = false;
         state.modelLoadedId = null;
-        throw new Error('El modelo cacheado está corrupto y fue eliminado. ' +
-                        'Vuelve a pulsar "Remover" para descargarlo de nuevo.');
+        throw new Error('El modelo cacheado está corrupto. Vuelve a pulsar "Remover".');
       }
     }
 
@@ -1336,7 +1309,6 @@ async function downloadModelWithFallback(modelId) {
   var lastErr = null;
   for (var i = 0; i < model.urls.length; i++) {
     try {
-      console.log('[JPB] Intentando descargar: ' + model.urls[i]);
       return await downloadWithProgress(model.urls[i], model.name);
     } catch (e) {
       lastErr = e;
@@ -1350,14 +1322,14 @@ async function downloadWithProgress(url, modelName) {
   var progressModal = $('#progressModal');
   var progressTitle = $('#progressTitle');
   var progressFill = $('#progressFill');
-  var progressText = $('#progressText');
+  var progressStats = $('#progressStats');
   var progressInfo = $('#progressInfo');
 
   openModal(progressModal);
   if (progressTitle) progressTitle.textContent = 'Descargando ' + (modelName || 'modelo');
   if (progressFill) progressFill.style.width = '0%';
-  if (progressText) progressText.textContent = '0%';
-  if (progressInfo) progressInfo.textContent = 'Conectando...';
+  if (progressStats) progressStats.innerHTML = '<span class="prog-left">Conectando...</span><span class="prog-right">0%</span>';
+  if (progressInfo) progressInfo.textContent = '';
 
   var resp;
   try { resp = await fetch(url, { mode: 'cors', credentials: 'omit' }); }
@@ -1375,30 +1347,31 @@ async function downloadWithProgress(url, modelName) {
   }
 
   var total = +(resp.headers.get('content-length') || 0);
-  console.log('[JPB] HTTP ' + resp.status + ' | Content-Type: ' + contentType +
-              ' | Content-Length: ' + (total ? formatBytes(total) : 'desconocido'));
-
   var reader = resp.body.getReader();
   var chunks = [];
   var received = 0;
+
+  // Actualizar UI con "MB / Total" a la izquierda y porcentaje a la derecha
+  function updateProgressUI() {
+    var pct = total ? Math.round(received / total * 100) : 0;
+    var left = formatBytes(received) + (total ? ' / ' + formatBytes(total) : '');
+    if (progressStats) {
+      progressStats.innerHTML =
+        '<span class="prog-left">' + left + '</span>' +
+        '<span class="prog-right">' + (total ? pct + '%' : '...') + '</span>';
+    }
+    if (progressFill) progressFill.style.width = (total ? pct : 0) + '%';
+  }
+
+  updateProgressUI();
 
   while (true) {
     var r = await reader.read();
     if (r.done) break;
     chunks.push(r.value);
     received += r.value.length;
-    if (total) {
-      var pct = Math.round(received / total * 100);
-      if (progressFill) progressFill.style.width = pct + '%';
-      if (progressText) progressText.textContent = pct + '%';
-      if (progressInfo) progressInfo.textContent = formatBytes(received) + ' / ' + formatBytes(total);
-    } else {
-      if (progressInfo) progressInfo.textContent = formatBytes(received);
-    }
+    updateProgressUI();
   }
-
-  console.log('[JPB] Descarga finalizada: ' + formatBytes(received) +
-              (total ? ' de ' + formatBytes(total) : ''));
 
   if (total > 0 && received < total) {
     closeModal(progressModal);
@@ -1420,13 +1393,13 @@ function openProgressModal() {
   var progressModal = $('#progressModal');
   var progressTitle = $('#progressTitle');
   var progressFill = $('#progressFill');
-  var progressText = $('#progressText');
+  var progressStats = $('#progressStats');
   var progressInfo = $('#progressInfo');
 
   openModal(progressModal);
   if (progressTitle) progressTitle.textContent = 'Removiendo objetos';
   if (progressFill) progressFill.style.width = '0%';
-  if (progressText) progressText.textContent = '';
+  if (progressStats) progressStats.innerHTML = '<span class="prog-left"></span><span class="prog-right"></span>';
   if (progressInfo) progressInfo.textContent = 'Analizando máscara...';
 }
 
